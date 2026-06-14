@@ -1,0 +1,12 @@
+# OS / editor cruft
+Thumbs.db
+.DS_Store
+*.user
+.vs/
+
+# Local Claude Code state (don't publish)
+.claude/settings.local.json
+
+# Logs / temp
+*.log
+*.tmp
