@@ -10,7 +10,7 @@
       "name": "claude-tfvc",
       "source": "./plugins/claude-tfvc",
       "description": "Use TFVC (tf.exe) instead of git: a knowledge skill, /tf-* commands, and a guarded auto-checkout hook.",
-      "version": "0.1.0",
+      "version": "0.1.1",
       "author": { "name": "Evgeny Satanovsky", "email": "jenka1980@gmail.com" },
       "keywords": ["tfvc", "tfs", "source-control", "dotnet", "windows"]
     }

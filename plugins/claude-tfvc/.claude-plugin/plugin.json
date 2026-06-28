@@ -2,13 +2,12 @@
   "name": "claude-tfvc",
   "displayName": "Claude TFVC",
   "description": "Use TFVC (TFS) source control with tf.exe instead of git on Windows .NET projects: a knowledge skill, /tf-* commands, and a guarded auto-checkout PreToolUse hook.",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "author": { "name": "Evgeny Satanovsky", "email": "jenka1980@gmail.com" },
   "license": "MIT",
   "homepage": "https://github.com/jenka1980/claude-tfvc",
   "repository": "https://github.com/jenka1980/claude-tfvc",
   "keywords": ["tfvc", "tfs", "source-control", "dotnet", "windows", "tf"],
   "skills": "./skills/",
-  "commands": "./commands/",
-  "hooks": "./hooks/hooks.json"
+  "commands": "./commands/"
 }
