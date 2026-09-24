@@ -20,14 +20,43 @@ against a server. On these projects, use `tf.exe` — **do not run git commands*
 - The user refers to TFS, TFVC, `tf.exe`, check-in/checkout, shelvesets, or workspaces.
 
 ## Locating tf.exe
-Resolve in this order:
-1. The `TF_EXE` environment variable (if set, use it verbatim).
-2. `tf.exe` on `PATH` (`Get-Command tf.exe`).
-3. A Visual Studio install, e.g.:
-   `…\Microsoft Visual Studio\<edition>\Common7\IDE\CommonExtensions\Microsoft\TeamFoundation\Team Explorer\TF.exe`
-   (probe 2022/2019/2017 and Enterprise/Professional/Community).
+Resolve in this order (the auto-checkout hook uses exactly the same order):
+1. The `TF_EXE` environment variable, if it points at an existing file (surrounding quotes are tolerated).
+2. `tf.exe` on `PATH`.
+3. `vswhere.exe` (`%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe`, present with any VS 2017+
+   install; it also finds installs outside Program Files): for each install, look for
+   `<installationPath>\Common7\IDE\CommonExtensions\Microsoft\TeamFoundation\Team Explorer\TF.exe`.
+4. Default install folders under Program Files and Program Files (x86):
+   - VS 2017+: `Microsoft Visual Studio\<version>\<edition>\Common7\IDE\CommonExtensions\Microsoft\TeamFoundation\Team Explorer\TF.exe`
+     (`<version>` is a year like `2022` or a major version like `18`; any edition, including BuildTools and TeamExplorer)
+   - VS 2010-2015: `Microsoft Visual Studio <n>.0\Common7\IDE\TF.exe`
 
-Tip: set `TF_EXE` once (machine env var) to avoid probing. All commands below assume `tf` resolves to that path.
+When several exist, the newest `TF.exe` wins. Old TFS servers (2010-era) may reject the newest client; set `TF_EXE`
+to an older TF.exe in that case. Tip: set `TF_EXE` once (user env var, then restart Claude Code) to skip probing.
+
+Use whichever shell tool you have. `tf` options work unchanged from both PowerShell and Git Bash, and `tf` accepts
+`-option` as well as `/option`. All commands below assume `$tf` / `"$tf"` resolves to that path.
+
+```powershell
+$tf = "$env:TF_EXE".Trim('"')
+if (-not ($tf -and (Test-Path $tf))) { $tf = (Get-Command tf.exe -ErrorAction SilentlyContinue).Source }
+if (-not $tf) {
+  $vsw = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+  if (Test-Path $vsw) {
+    $tf = & $vsw -all -prerelease -products * -property installationPath |
+      ForEach-Object { Join-Path $_ 'Common7\IDE\CommonExtensions\Microsoft\TeamFoundation\Team Explorer\TF.exe' } |
+      Where-Object { Test-Path $_ } | Select-Object -First 1
+  }
+}
+& $tf status
+```
+
+```bash
+tf="${TF_EXE//\"/}"                                   # TF_EXE with any quotes stripped
+[ -f "$tf" ] || tf="$(command -v tf.exe)"
+[ -n "$tf" ] || tf="$("/c/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe" -all -prerelease -products '*' -property installationPath 2>/dev/null | tr -d '\r' | while read -r p; do f="$p\\Common7\\IDE\\CommonExtensions\\Microsoft\\TeamFoundation\\Team Explorer\\TF.exe"; [ -f "$f" ] && { echo "$f"; break; }; done)"
+"$tf" status
+```
 
 ## The core model: read-only until checkout
 TFVC keeps unchanged files **read-only**. To edit a file you must check it out first; otherwise the write fails.

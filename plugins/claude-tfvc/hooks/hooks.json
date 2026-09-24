@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "pwsh -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PLUGIN_ROOT}/hooks/tfvc-checkout.ps1\"",
+            "command": "powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"${CLAUDE_PLUGIN_ROOT}/hooks/tfvc-checkout.ps1\"",
             "timeout": 30,
             "statusMessage": "TFVC: checking out file if read-only..."
           }
