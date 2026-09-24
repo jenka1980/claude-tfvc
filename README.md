@@ -12,8 +12,11 @@ It provides:
 
 ## Requirements
 - **Windows** (TFVC's `tf.exe` is Windows-only).
-- Visual Studio with Team Explorer, or `tf.exe` otherwise available.
-- PowerShell (`pwsh` or Windows PowerShell) for the hook.
+- Visual Studio with Team Explorer (2010 or later), or `tf.exe` otherwise available.
+- **Windows PowerShell 5.1** for the hook. It ships with every supported Windows, so there is nothing to install.
+  PowerShell 7 (`pwsh`) is **not** required, and gains nothing here: both start the hook in about the same time.
+- Git for Windows is optional. Claude runs `tf` from whichever shell tool it has (PowerShell or Git Bash); `tf`'s
+  `/option` syntax works unchanged from both.
 
 ## Install
 ```text
@@ -24,15 +27,42 @@ Installed plugins are user-level — available in every project on your machine.
 install if the commands/hook don't appear immediately.
 
 ## Configuration
-`tf.exe` is resolved in this order: **`TF_EXE` env var → `PATH` → a Visual Studio install** (probes 2022 / 2019 /
-2017, all editions). For reliability, set `TF_EXE` to your `tf.exe` once, e.g.:
+`tf.exe` is resolved in this order, by the skill and the hook alike (one shared script,
+`skills/tfvc/scripts/Find-Tf.ps1`; run it with `-List` to see every TF.exe on the machine with its version):
+1. **The project's own choice** — `env.TF_EXE` in `<project>\.claude\settings.local.json` (then
+   `.claude\settings.json`). Set it with **`/tf-select`** (below). This is how one machine uses different TF.exe
+   versions for different projects.
+2. **`TF_EXE`** env var — the machine-wide default.
+3. **`tf.exe` on `PATH`**.
+4. **`vswhere.exe`** (installed with any VS 2017+), which also finds Visual Studio installs outside Program Files.
+5. **Default Visual Studio folders** under Program Files / Program Files (x86): VS 2017+ (any version folder — a
+   year like `2022` or a major version like `18` — and any edition, including BuildTools and TeamExplorer) and
+   VS 2010–2015 (`Microsoft Visual Studio <n>.0\Common7\IDE\TF.exe`).
+
+A configured value (1–2) is used only if it points at an existing file; surrounding quotes are tolerated and a stale
+path falls through. When several are found (4–5), the **newest `TF.exe` wins**.
+
+### Per-project choice: `/tf-select`
+A TFS 2010-era server may reject newer clients while your other projects want the newest TF.exe. Run `/tf-select`
+inside a project: it lists every TF.exe on the machine with its version, lets you pick one (or `auto` to remove the
+override), and writes it to the project's `.claude\settings.local.json`:
+```json
+{ "env": { "TF_EXE": "C:\\Program Files (x86)\\Microsoft Visual Studio\\2017\\Professional\\Common7\\IDE\\CommonExtensions\\Microsoft\\TeamFoundation\\Team Explorer\\TF.exe" } }
+```
+`/tf-select 2017`, `/tf-select 15` (major file version) or `/tf-select <path>` skip the question. The choice applies
+immediately — the hook and the skill read the file directly, and Claude Code also exports it as `TF_EXE` for shell
+commands — and stays on this machine: TFVC does not track `.claude\` unless you `tf add` it.
+
+### Machine-wide default: `TF_EXE`
 ```powershell
 setx TF_EXE "C:\Program Files (x86)\Microsoft Visual Studio\2017\Professional\Common7\IDE\CommonExtensions\Microsoft\TeamFoundation\Team Explorer\TF.exe"
 ```
+`setx` only affects new processes — **restart Claude Code** afterwards.
 
 ## Commands
 | Command | Action |
 |---|---|
+| `/tf-select [version\|path\|auto]` | Choose this project's TF.exe (writes `.claude\settings.local.json`) |
 | `/tf-status` | Show pending changes (`tf status`) |
 | `/tf-checkout [path]` | Check out file(s) for editing (`tf checkout`) |
 | `/tf-checkin [comment] [path]` | Check in — **asks for confirmation first** (`tf checkin`) |
@@ -40,11 +70,17 @@ setx TF_EXE "C:\Program Files (x86)\Microsoft Visual Studio\2017\Professional\Co
 | `/tf-undo [path]` | Discard pending changes — **asks for confirmation first** (`tf undo`) |
 
 ## The auto-checkout hook
-A `PreToolUse` hook on `Edit`/`Write` runs `hooks/tfvc-checkout.ps1`, which:
-1. reads the target file path from the tool input,
+A `PreToolUse` hook on `Edit`/`Write` runs `hooks/tfvc-checkout.ps1` via `powershell.exe` (Windows PowerShell
+5.1), which:
+1. reads the target file path from the tool input (as UTF-8, so non-ASCII paths work on any console code page),
 2. acts **only if that file is read-only** (so writable files and non-TFVC projects are skipped instantly),
-3. resolves `tf.exe` and runs `tf checkout` best-effort,
+3. resolves `tf.exe` (order above) and runs `tf checkout /noprompt` best-effort — `/noprompt` makes a missing
+   server login fail fast instead of opening a credential dialog,
 4. **always allows the edit to proceed** (it never denies/blocks).
+
+**Locked-down machines:** if Group Policy pins the PowerShell execution policy, or AppLocker blocks scripts under
+the user profile, the hook cannot run and degrades to a no-op — the edit still proceeds, you just see a hook error.
+Use `/tf-checkout` manually in that case.
 
 **Disable it** by removing the `PreToolUse` block from `hooks/hooks.json` (or uninstalling the plugin). It only
 calls `tf checkout` — it never checks in.
@@ -60,6 +96,13 @@ Check your type with `tf workspaces /collection:<url>`.
 - Covers the everyday checkout/checkin/status/get/undo loop. Branching/merging/shelvesets are not wrapped as
   commands (use `tf.exe` directly; the skill documents the model).
 - Windows-only by nature of `tf.exe`.
+
+## Tests
+- `tests\test-hook.ps1` exercises the hook, `hooks.json` and the resolver under Windows PowerShell 5.1 and pwsh
+  (console code page forced to 862, fake `tf`, fake Visual Studio trees, fake projects):
+  `powershell -NoProfile -ExecutionPolicy Bypass -File tests\test-hook.ps1`
+- `tests\skill-evals\` holds pressure-scenario evals for the skill (run with and without the skill in a sandbox
+  with a fake `tf.exe`); see its README.
 
 ## License
 MIT © Evgeny Satanovsky

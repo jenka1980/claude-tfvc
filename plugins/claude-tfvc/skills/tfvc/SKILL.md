@@ -1,67 +1,79 @@
 ---
 name: tfvc
 description: >
-  Use when working in a TFVC / TFS (Team Foundation Version Control) project on Windows — i.e. there is
-  no .git directory, source files are read-only until checked out, or the user mentions TFS/TFVC/tf.exe,
-  checkout/checkin, shelvesets, or workspaces. Teaches Claude to use tf.exe for source control instead of
-  git: locating tf.exe, the read-only/checkout model, status/checkout/checkin/get/undo, and the
-  local-vs-server workspace and .tfignore caveats.
+  Use tf.exe (TFVC, TFS, Team Foundation Version Control, also hosted by Azure DevOps Server) instead of git on
+  Windows projects. Use this whenever a project has no .git folder, files are read-only until checked out (saving
+  fails with EPERM or "access denied"), tf.exe reports "no working folder mapping", or the user mentions TFS, TFVC,
+  Team Explorer, tf.exe, check-in, checkout, pending changes, shelvesets, workspaces, or which TF.exe or Visual
+  Studio version a project should use (/tf-select), even when they say "commit" or "git". Covers finding tf.exe,
+  the read-only/checkout model, status/checkout/checkin/get/undo/shelve, and local-vs-server workspaces with
+  .tfignore.
 ---
 
 # Working with TFVC (TFS) instead of git
 
-TFVC (Team Foundation Version Control) is Microsoft's **centralized** source-control system. It is **not git**:
-there is no local history, no `.git`, and edits go through an explicit **checkout → change → check-in** cycle
-against a server. On these projects, use `tf.exe` — **do not run git commands**.
+TFVC is Microsoft's **centralized** source control: no local history, no `.git`, and every edit goes through
+**checkout → change → check-in** against a server. On these projects use `tf.exe`, never git. A folder that has a
+`.git` directory is not TFVC, even when TFS or Azure DevOps hosts that git repo.
 
-## When this applies
-- The working tree has **no `.git`** directory, and/or
-- Source files are **read-only** on disk (TFVC marks files read-only until you check them out), and/or
-- The user refers to TFS, TFVC, `tf.exe`, check-in/checkout, shelvesets, or workspaces.
+## Finding tf.exe
+Run the resolver bundled with this skill; it prints the full path to use (exit code 1 if it finds none):
 
-## Locating tf.exe
-Resolve in this order:
-1. The `TF_EXE` environment variable (if set, use it verbatim).
-2. `tf.exe` on `PATH` (`Get-Command tf.exe`).
-3. A Visual Studio install, e.g.:
-   `…\Microsoft Visual Studio\<edition>\Common7\IDE\CommonExtensions\Microsoft\TeamFoundation\Team Explorer\TF.exe`
-   (probe 2022/2019/2017 and Enterprise/Professional/Community).
+```
+powershell -NoProfile -ExecutionPolicy Bypass -File "${CLAUDE_SKILL_DIR}/scripts/Find-Tf.ps1"
+```
 
-Tip: set `TF_EXE` once (machine env var) to avoid probing. All commands below assume `tf` resolves to that path.
+Add `-List` to see every TF.exe on the machine with its file version (15 = VS 2017, 16 = VS 2019, 17 = VS 2022,
+18 = VS 18); that is what `/tf-select` shows before pinning one for a project. The order is: the project's
+`.claude/settings.local.json` (then `settings.json`) `env.TF_EXE`, the `TF_EXE` environment variable, PATH,
+vswhere, then the default Visual Studio folders, newest version first; a configured path that no longer exists
+falls through. The same command line works from PowerShell and from Git Bash, because `powershell.exe` is on every
+Windows, and `tf` accepts `-option` as well as `/option` from either shell. Below, `tf` stands for that resolved
+path.
 
 ## The core model: read-only until checkout
-TFVC keeps unchanged files **read-only**. To edit a file you must check it out first; otherwise the write fails.
-This plugin's PreToolUse hook auto-runs `tf checkout` on read-only files before an edit, but you can also do it
-explicitly with `/tf-checkout` or the commands below.
+TFVC keeps unchanged files read-only, so a write fails (EPERM, "access denied") until the file is checked out.
+The plugin's PreToolUse hook runs `tf checkout` on a read-only file right before Edit/Write; `/tf-checkout` does
+the same explicitly.
 
 ## Everyday commands
 ```text
 tf status                              # pending changes in the workspace
-tf checkout <path>                     # mark file(s) editable (a.k.a. "tf edit")
-tf add <path>                          # add a new file to source control
+tf checkout <path>                     # make file(s) editable (same as: tf edit)
+tf add <path>                          # start tracking a new file
 tf checkin /comment:"message" <path>   # commit pending changes to the server
 tf get [<path>] [/recursive]           # get latest from the server
 tf undo <path>                         # discard a pending change / checkout
-tf rename <old> <new>                  # move/rename under source control
+tf rename <old> <new>                  # move or rename under source control
 tf delete <path>                       # delete under source control
-tf workspaces /collection:<url>        # list workspaces (and their type)
+tf shelve <name> [/comment:"..."]      # park pending changes on the server as a shelveset (/replace updates it)
+tf unshelve <name>                     # bring a shelveset back into the workspace
+tf workspaces /collection:<url>        # list workspaces (/format:detailed shows local vs server)
 ```
-New files: create the file, then `tf add` it (it won't be tracked otherwise). Renames/moves/deletes must go
-through `tf rename` / `tf delete` so the server records them — don't use OS move/del for tracked files.
 
-## Local vs server workspaces (important)
-- **Local workspaces** (VS 2012+ default): support offline edits and honor a **`.tfignore`** file for excluding
-  files from "Detected/Add" — `tf checkout` is often unnecessary because edits are detected locally.
-- **Server workspaces** (common on older TFS, e.g. TFS 2010): require an explicit `tf checkout` before editing
-  (files stay read-only), and **do NOT honor `.tfignore`** — exclude files via the Pending Changes
-  "Excluded/Detected" list or simply never `tf add` them.
+## Local vs server workspaces
+- **Local** (VS 2012+ default): edits are detected without checkout and `.tfignore` is honored.
+- **Server** (typical on TFS 2010-era servers): files stay read-only until `tf checkout`, and `.tfignore` is
+  ignored, so keep junk out by never `tf add`ing it (or via the Pending Changes "Excluded" list in VS).
 
-Check the type with `tf workspaces /collection:<url>` (or VS → manage workspaces). If `.tfignore` doesn't seem to
-work, the workspace is almost certainly a server workspace.
+`.tfignore` "not working" almost always means a server workspace; confirm with `tf workspaces`.
 
 ## Rules of engagement
-- Prefer `tf` over git in TFVC projects. **Do not** run `git init`/`git add`/`git commit` here.
-- **Never check in** unless the user explicitly asks; describe the pending changes and let them confirm.
-- Treat connection strings / secrets as out-of-band — never add files containing live credentials.
-- When an edit fails because a file is read-only, check it out (`tf checkout`) rather than clearing the
-  read-only attribute by hand.
+- Never run `git init`, `git add` or `git commit` in a TFVC project, even when the user says "commit". "Commit"
+  means: show `tf status`, then ask them to confirm the exact pending set, and run `tf checkin` **only after that
+  explicit confirmation**. Check-ins are visible to the whole team and cannot be quietly undone. A request that
+  already names the files and the comment is still the request, not the confirmation, and a deadline, "I'm
+  leaving now" or the lack of a follow-up turn does not waive it: when you cannot ask, stop with the pending set
+  shown and the exact `tf checkin` line that a "yes" would run.
+- New files are invisible to the server until `tf add`; renames and deletes go through `tf rename` and
+  `tf delete`, so the server records them.
+- `tf undo` discards local edits irreversibly; confirm first.
+
+## Common mistakes
+| Mistake | Do this instead |
+|---|---|
+| Clearing the read-only attribute (`attrib -r`, `IsReadOnly = $false`) to force a write | `tf checkout` the file; a stripped attribute leaves an edit the server never sees |
+| Moving or deleting tracked files with the OS | `tf rename` / `tf delete` |
+| `tf add`ing bin/obj, packages, `*.user` or files holding credentials | Leave build output and secrets out; connection strings travel out-of-band |
+| Checking in because the task "is done" | Check in only when the user asks, after they confirm the pending set |
+| Using the newest TF.exe against an old server | Pin an older TF.exe for that project with `/tf-select` |
