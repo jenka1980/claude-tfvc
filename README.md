@@ -27,16 +27,33 @@ Installed plugins are user-level — available in every project on your machine.
 install if the commands/hook don't appear immediately.
 
 ## Configuration
-`tf.exe` is resolved in this order, by the skill and the hook alike:
-1. **`TF_EXE`** env var, if it points at an existing file (surrounding quotes are tolerated).
-2. **`tf.exe` on `PATH`**.
-3. **`vswhere.exe`** (installed with any VS 2017+), which also finds Visual Studio installs outside Program Files.
-4. **Default Visual Studio folders** under Program Files / Program Files (x86): VS 2017+ (any version folder — a
+`tf.exe` is resolved in this order, by the skill and the hook alike (one shared script,
+`skills/tfvc/scripts/Find-Tf.ps1`; run it with `-List` to see every TF.exe on the machine with its version):
+1. **The project's own choice** — `env.TF_EXE` in `<project>\.claude\settings.local.json` (then
+   `.claude\settings.json`). Set it with **`/tf-select`** (below). This is how one machine uses different TF.exe
+   versions for different projects.
+2. **`TF_EXE`** env var — the machine-wide default.
+3. **`tf.exe` on `PATH`**.
+4. **`vswhere.exe`** (installed with any VS 2017+), which also finds Visual Studio installs outside Program Files.
+5. **Default Visual Studio folders** under Program Files / Program Files (x86): VS 2017+ (any version folder — a
    year like `2022` or a major version like `18` — and any edition, including BuildTools and TeamExplorer) and
    VS 2010–2015 (`Microsoft Visual Studio <n>.0\Common7\IDE\TF.exe`).
 
-When several are found, the **newest `TF.exe` wins**. Set `TF_EXE` to pin a specific one — for example a TFS
-2010-era server may reject newer clients, so point it at VS 2017's:
+A configured value (1–2) is used only if it points at an existing file; surrounding quotes are tolerated and a stale
+path falls through. When several are found (4–5), the **newest `TF.exe` wins**.
+
+### Per-project choice: `/tf-select`
+A TFS 2010-era server may reject newer clients while your other projects want the newest TF.exe. Run `/tf-select`
+inside a project: it lists every TF.exe on the machine with its version, lets you pick one (or `auto` to remove the
+override), and writes it to the project's `.claude\settings.local.json`:
+```json
+{ "env": { "TF_EXE": "C:\\Program Files (x86)\\Microsoft Visual Studio\\2017\\Professional\\Common7\\IDE\\CommonExtensions\\Microsoft\\TeamFoundation\\Team Explorer\\TF.exe" } }
+```
+`/tf-select 2017`, `/tf-select 15` (major file version) or `/tf-select <path>` skip the question. The choice applies
+immediately — the hook and the skill read the file directly, and Claude Code also exports it as `TF_EXE` for shell
+commands — and stays on this machine: TFVC does not track `.claude\` unless you `tf add` it.
+
+### Machine-wide default: `TF_EXE`
 ```powershell
 setx TF_EXE "C:\Program Files (x86)\Microsoft Visual Studio\2017\Professional\Common7\IDE\CommonExtensions\Microsoft\TeamFoundation\Team Explorer\TF.exe"
 ```
@@ -45,6 +62,7 @@ setx TF_EXE "C:\Program Files (x86)\Microsoft Visual Studio\2017\Professional\Co
 ## Commands
 | Command | Action |
 |---|---|
+| `/tf-select [version\|path\|auto]` | Choose this project's TF.exe (writes `.claude\settings.local.json`) |
 | `/tf-status` | Show pending changes (`tf status`) |
 | `/tf-checkout [path]` | Check out file(s) for editing (`tf checkout`) |
 | `/tf-checkin [comment] [path]` | Check in — **asks for confirmation first** (`tf checkin`) |
@@ -78,6 +96,13 @@ Check your type with `tf workspaces /collection:<url>`.
 - Covers the everyday checkout/checkin/status/get/undo loop. Branching/merging/shelvesets are not wrapped as
   commands (use `tf.exe` directly; the skill documents the model).
 - Windows-only by nature of `tf.exe`.
+
+## Tests
+- `tests\test-hook.ps1` exercises the hook, `hooks.json` and the resolver under Windows PowerShell 5.1 and pwsh
+  (console code page forced to 862, fake `tf`, fake Visual Studio trees, fake projects):
+  `powershell -NoProfile -ExecutionPolicy Bypass -File tests\test-hook.ps1`
+- `tests\skill-evals\` holds pressure-scenario evals for the skill (run with and without the skill in a sandbox
+  with a fake `tf.exe`); see its README.
 
 ## License
 MIT © Evgeny Satanovsky

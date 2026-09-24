@@ -1,0 +1,82 @@
+[
+  {
+    "query": "ok so I'm in D:\\Projects\\One.Net\\OneManager and every time I try to save Live.asmx.cs the write fails with EPERM operation not permitted. there's no .git folder here, we use TFS at work. can you fix the null check in GetLiveMatches and get the file saved?",
+    "should_trigger": true
+  },
+  {
+    "query": "commit my changes in the MastersMonitor project with message 'fix app.config timeout' - heads up, this one is on our old TFS 2010 server, not github",
+    "should_trigger": true
+  },
+  {
+    "query": "which tf.exe is claude using for this solution? we have VS 2017 and VS 2022 installed and the server only accepts the older client. I want just this project pinned to the 2017 one",
+    "should_trigger": true
+  },
+  {
+    "query": "tf status shows like 400 pending adds under packages\\ and bin\\ that I never wanted. why doesn't my .tfignore work and how do I get rid of them without checking anything in",
+    "should_trigger": true
+  },
+  {
+    "query": "shelve what I have so far as 'wip-basketball-match' so my teammate can pull it on her box, then undo my local changes",
+    "should_trigger": true
+  },
+  {
+    "query": "I need to rename OneObj\\Models\\Leagues\\Match.cs to MatchBase.cs and move it into Models\\Common. project is under Team Foundation Version Control, please do it the right way so the server sees the rename",
+    "should_trigger": true
+  },
+  {
+    "query": "getting 'There is no working folder mapping for D:\\Mobile1\\YouTubeReports' when running tf get. what does that mean and how do I map it",
+    "should_trigger": true
+  },
+  {
+    "query": "add the new VideoEditor.cs file to source control and check in everything with comment 'video editor v2' - its the OneManager solution, Team Explorer says server workspace",
+    "should_trigger": true
+  },
+  {
+    "query": "our legacy .NET 4 app has read-only source files and no git. before I make changes to app.config, what do I have to do so the edit actually goes through and shows up as a pending change?",
+    "should_trigger": true
+  },
+  {
+    "query": "/tf-select isn't picking the right Visual Studio, list the TF.exe versions on this machine and tell me which one the OneDAL project resolves to and why",
+    "should_trigger": true
+  },
+  {
+    "query": "we migrated the OneSITES repo from TFVC to git on Azure DevOps last month. it's a normal git clone now in D:\\Projects\\OneSITES. rebase my feature branch on main and squash the last 3 commits",
+    "should_trigger": false
+  },
+  {
+    "query": "write a PowerShell script that recursively finds all read-only files under D:\\Backups and clears the attribute so the backup job can overwrite them",
+    "should_trigger": false
+  },
+  {
+    "query": "our Azure DevOps pipeline (yaml) fails on the NuGet restore step for the OneApps solution, here's the log... what's wrong with the restore task?",
+    "should_trigger": false
+  },
+  {
+    "query": "explain the difference between git fetch and git pull, and when I should use rebase vs merge",
+    "should_trigger": false
+  },
+  {
+    "query": "my teammate says 'check in' when she means git commit. write a short onboarding note for new devs on our git branching model (feature branches, PRs into main)",
+    "should_trigger": false
+  },
+  {
+    "query": "the MSBuild for One.Net only compiles with VS2017, can you run the build with the 2017 msbuild and show me the errors",
+    "should_trigger": false
+  },
+  {
+    "query": "getting EPERM: operation not permitted when npm install tries to rename node_modules\\.staging on Windows, how do I fix it",
+    "should_trigger": false
+  },
+  {
+    "query": "create a workspace in VS Code for the three microservices in D:\\Projects\\Svc so I can open them together with shared settings",
+    "should_trigger": false
+  },
+  {
+    "query": "Team Foundation Server 2018 work item query: I need a WIQL query that lists all bugs assigned to me changed in the last 7 days, using the REST API from PowerShell",
+    "should_trigger": false
+  },
+  {
+    "query": "a file in my git repo keeps showing as modified because of line endings, and git status won't clear it. fix the .gitattributes so CRLF files stop flapping",
+    "should_trigger": false
+  }
+]

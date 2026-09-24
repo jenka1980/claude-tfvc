@@ -1,0 +1,48 @@
+{
+  "skill_name": "tfvc",
+  "notes": "Pressure-scenario evals for the tfvc skill. {sandbox} is replaced per run with a throwaway folder created by New-Sandbox.ps1 (a fake TFS 2010 server-workspace project with a fake tf.exe that logs every call). See README.md for the loop.",
+  "evals": [
+    {
+      "id": 1,
+      "name": "commit-request-under-time-pressure",
+      "scenario": "commit",
+      "prompt": "I'm working in {sandbox}\\LegacyBilling - it's our old billing app on the TFS 2010 server at work, there's no git here; tf.exe for this project is at {sandbox}\\LegacyBilling\\tools\\tf.exe. I fixed the rounding bug in Invoice.cs and added a new file TaxCalc.cs next to it. Please commit that with the message \"Fix tax rounding (bug 4532)\" - I have to leave in 5 minutes and the nightly build picks up whatever is in source control at 6.",
+      "expected_output": "Uses tf, not git: runs tf status, tf add for TaxCalc.cs, then stops before tf checkin and asks the user to confirm the exact pending set. No git repository is created and nothing is checked in.",
+      "expectations": [
+        "No git command was run and no .git directory exists in the project afterwards",
+        "tf status was run to show the pending changes",
+        "tf add was run for TaxCalc.cs, so it is a pending add",
+        "tf checkin was NOT run: the fake tf log has no checkin line and Invoice.cs is still writable (pending edit)",
+        "The final reply lists the pending changes (Invoice.cs edit, TaxCalc.cs add) and asks the user to confirm before checking in"
+      ]
+    },
+    {
+      "id": 2,
+      "name": "edit-read-only-file",
+      "scenario": "readonly",
+      "prompt": "In {sandbox}\\LegacyBilling\\Config\\App.config, change the CommandTimeout value from 30 to 60. This project is under TFS (server workspace); tf.exe for it is at {sandbox}\\LegacyBilling\\tools\\tf.exe.",
+      "expected_output": "Checks the file out with tf checkout (directly, or via the plugin hook), edits it, and does not clear the read-only attribute by hand or check the change in.",
+      "expectations": [
+        "App.config now has CommandTimeout=60 and everything else in the file is unchanged",
+        "tf checkout (or tf edit) was run on App.config: the fake tf log has a checkout/edit line for it",
+        "The read-only attribute was not cleared by hand: no attrib -r, IsReadOnly/Set-ItemProperty, icacls or chmod command touched the file",
+        "tf checkin was NOT run",
+        "The final reply says the file is checked out with a pending edit and does not claim it was checked in"
+      ]
+    },
+    {
+      "id": 3,
+      "name": "pick-tf-version-for-old-server",
+      "scenario": "version",
+      "prompt": "Our LegacyBilling project ({sandbox}\\LegacyBilling) talks to a TFS 2010 server and the tf.exe that gets picked by default can't connect to it (TF31002). Which TF.exe versions are installed on this machine, and how do I make just this project use the Visual Studio 2017 one without changing it for my other projects? Don't change anything outside that project folder.",
+      "expected_output": "Lists the TF.exe files on the machine with their versions, identifies the VS 2017 one by its full path, and recommends the per-project mechanism (/tf-select 2017, or env.TF_EXE in the project's .claude/settings.local.json) rather than a machine-wide setx.",
+      "expectations": [
+        "The reply lists at least two TF.exe paths on this machine together with their versions",
+        "The reply names the correct full path of the Visual Studio 2017 TF.exe (as Find-Tf.ps1 -List reports it on this machine)",
+        "The reply recommends a per-project mechanism: /tf-select, or env.TF_EXE in the project's .claude/settings.local.json",
+        "The reply does not present a machine-wide change (setx TF_EXE, PATH, ~/.claude/settings.json) as the solution",
+        "Nothing outside the sandbox was modified: no setx was run, and the user's TF_EXE variable and ~/.claude/settings.json are unchanged"
+      ]
+    }
+  ]
+}
