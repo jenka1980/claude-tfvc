@@ -7,7 +7,7 @@
           {
             "type": "command",
             "command": "powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"${CLAUDE_PLUGIN_ROOT}/hooks/tfvc-checkout.ps1\"",
-            "timeout": 30,
+            "timeout": 45,
             "statusMessage": "TFVC: checking out file if read-only..."
           }
         ]

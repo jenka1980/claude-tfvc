@@ -524,6 +524,69 @@ try {
         Note 'R3c Git Bash leaves /noprompt alone (INFO when it becomes a path: then SKILL.md recommends -option from Bash, Task 10)' (($r.Calls.Count -eq 1) -and ($r.Calls[0][1] -eq '/noprompt')) "got=[$($r.Calls[0] -join '|')]"
     } else { Skip 'R3b/R3c Git Bash' 'Git Bash or fake tf.exe missing' }
 
+    # ---- hook in relay mode -----------------------------------------------------------------------------
+    function New-TestFile([string]$Path, [bool]$ReadOnly) {
+        if (Test-Path -LiteralPath $Path) { (Get-Item -LiteralPath $Path).IsReadOnly = $false }
+        Set-Content -LiteralPath $Path -Value 'x'
+        (Get-Item -LiteralPath $Path).IsReadOnly = $ReadOnly
+    }
+    function Invoke-HookCase([string]$Exe, [hashtable]$EnvVars, [string]$Path) {
+        Reset-FakeLog
+        $payload = @{ tool_input = @{ file_path = $Path }; cwd = $Proj } | ConvertTo-Json -Compress
+        $saved = Set-TestEnv $EnvVars
+        $savedOe = $global:OutputEncoding
+        $global:OutputEncoding = New-Object System.Text.UTF8Encoding $false   # Claude Code pipes the payload as UTF-8; 5.1 defaults to ASCII ('?')
+        try { $out = ($payload | & $Exes[$Exe] -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $Hook 2>&1 | Out-String).Trim(); $code = $LASTEXITCODE }
+        finally { $global:OutputEncoding = $savedOe; Restore-TestEnv $saved }
+        return @{ Exit = $code; Out = $out; Calls = @(Get-FakeCalls) }
+    }
+    $RoFile  = Join-Path $S 'ro.txt';                                 New-TestFile $RoFile $true
+    $RoHeb   = Join-Path $S "ro-$([char]0x5E9)$([char]0x5DC).txt";    New-TestFile $RoHeb $true
+    $RwFile  = Join-Path $S 'rw.txt';                                 New-TestFile $RwFile $false
+    $HookEnv = Merge-Env $RelayEnv @{ CLAUDE_PROJECT_DIR = $Proj }    # $Proj\.claude\settings.local.json says relay
+    if ($HaveFake) {
+        foreach ($exe in $Exes.Keys) {
+            Reset-Relay; Wait-NoWorker
+            $r = Invoke-HookCase $exe $HookEnv $RoFile
+            Check "$exe R10 hook, relay mode: read-only file -> 'checkout /noprompt <path>' through the queue, exit 0, silent" `
+                (($r.Exit -eq 0) -and ($r.Out -eq '') -and ($r.Calls.Count -eq 1) -and (($r.Calls[0] -join ' ') -eq "checkout /noprompt $RoFile")) "exit=$($r.Exit) out=[$($r.Out)] args=[$($r.Calls[0] -join '|')]"
+            New-TestFile $RoFile $true
+
+            Wait-NoWorker   # R10's worker lingers 1 s and would serve this request
+            $r = Invoke-HookCase $exe (Merge-Env $HookEnv @{ CLAUDE_TFVC_RELAY_LAUNCH = 'none' }) $RoHeb
+            $json = $null; try { $json = $r.Out | ConvertFrom-Json } catch { }
+            $ctx = if ($json) { "$($json.hookSpecificOutput.additionalContext)" } else { '' }
+            Check "$exe R27 hook, relay unavailable: exit 0 and valid additionalContext JSON naming the Hebrew path and the registration command" `
+                (($r.Exit -eq 0) -and ($json.hookSpecificOutput.hookEventName -eq 'PreToolUse') -and $ctx.Contains($RoHeb) -and ($ctx -match 'not registered') -and ($ctx -match 'Register-TfRelay\.ps1') -and ($r.Calls.Count -eq 0)) "exit=$($r.Exit) out=[$($r.Out)]"
+
+            $r = Invoke-HookCase $exe (Merge-Env $DirectEnv @{ CLAUDE_PROJECT_DIR = $ProjNone }) $RoFile
+            Check "$exe R10b hook, direct mode (local session): tf called directly, exit 0, silent" (($r.Exit -eq 0) -and ($r.Out -eq '') -and ($r.Calls.Count -eq 1)) "exit=$($r.Exit) out=[$($r.Out)]"
+            New-TestFile $RoFile $true
+
+            # The hook passes only 'checkout /noprompt <file>', so the fake cannot be told to fail; drive a failure
+            # through the transport instead: forced relay with the unsigned bypass removed -> worker refusal -> 120.
+            Reset-Relay; Wait-NoWorker
+            # A powershell.exe worker spawned by pwsh inherits PowerShell 7's module path and cannot load
+            # Get-AuthenticodeSignature (test seam only: the real task starts clean), so a 5.1 client starts the
+            # worker first (refused request, 5 s linger) and the hook under test then talks to that worker.
+            $refuseEnv = Merge-Env $HookEnv @{ CLAUDE_TFVC_RELAY_ALLOW_UNSIGNED = $null; CLAUDE_TFVC_RELAY_LINGER_SEC = '5' }
+            $null = Invoke-InChild 'powershell' $refuseEnv ". '$InvokeTf'; `$null = Invoke-Tf -Arguments @('status') -Capture"
+            $r = Invoke-HookCase $exe $refuseEnv $RoFile
+            $json = $null; try { $json = $r.Out | ConvertFrom-Json } catch { }
+            $ctx = if ($json) { "$($json.hookSpecificOutput.additionalContext)" } else { '' }
+            Check "$exe R27b hook, worker refusal: exit 0 and additionalContext carries the transport, code 120 and the reason" `
+                (($r.Exit -eq 0) -and ($ctx -match 'relay, exit 120') -and ($ctx -match 'not a Microsoft-signed')) "exit=$($r.Exit) out=[$($r.Out)]"
+            Wait-NoWorker
+
+            $freshRoot = Join-Path $S "relay-r11-$exe"
+            $r = Invoke-HookCase $exe (Merge-Env $HookEnv @{ CLAUDE_TFVC_RELAY_ROOT = $freshRoot }) $RwFile
+            Check "$exe R11 hook, writable file: nothing runs, no relay folder appears" (($r.Exit -eq 0) -and ($r.Out -eq '') -and ($r.Calls.Count -eq 0) -and (-not (Test-Path -LiteralPath $freshRoot))) "exit=$($r.Exit) out=[$($r.Out)] folder=$(Test-Path -LiteralPath $freshRoot)"
+
+            $r = Invoke-InChild 'powershell' $DirectEnv ". '$InvokeTf'; `$x = Invoke-Tf -Arguments @('status','/stderr:TF30063: You are not authorized') -Capture; `"`$(`$x.ExitCode)|`$(`$x.Diagnostic)`""
+            Check 'R15d capture mode (hook path): the TF30063 hint lands in Diagnostic, not on stderr' (($r.Out -match '^0\|') -and ($r.Out -match 'Run /tf-relay')) "out=[$($r.Out)]"
+        }
+    } else { Skip 'R10/R11/R27 hook in relay mode' 'no fake tf.exe' }
+
     # ---- report (keep this anchor last; later tasks insert their checks above it) --------------------
 }
 catch { Check 'HARNESS aborted by an exception (every check after this point was skipped)' $false "$($_.Exception.Message) at $($_.InvocationInfo.ScriptLineNumber)" }

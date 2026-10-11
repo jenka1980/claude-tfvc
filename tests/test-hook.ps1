@@ -293,6 +293,10 @@ foreach ($f in @($Hook, $FindTf)) {
 $hookText = Get-Content -LiteralPath $Hook -Raw
 Check "T23 the hook loads Find-Tf.ps1 instead of carrying its own resolver (single implementation)" `
     (($hookText -match 'Find-Tf\.ps1') -and ($hookText -notmatch 'function\s+Resolve-TfExe')) "references Find-Tf.ps1=$($hookText -match 'Find-Tf\.ps1') defines Resolve-TfExe=$($hookText -match 'function\s+Resolve-TfExe')"
+Check "T24 the hook runs tf through Invoke-Tf.ps1 (no direct tf invocation, no own transport logic)" `
+    (($hookText -match 'Invoke-Tf\.ps1') -and ($hookText -match 'Invoke-Tf -Arguments') -and ($hookText -notmatch '&\s*\$tf\b')) "loads launcher=$($hookText -match 'Invoke-Tf\.ps1') calls Invoke-Tf=$($hookText -match 'Invoke-Tf -Arguments')"
+$hookTimeout = (Get-Content -LiteralPath $HooksJson -Raw | ConvertFrom-Json).hooks.PreToolUse[0].hooks[0].timeout
+Check "T28 hooks.json timeout leaves margin over the hook's 20 s relay budget (>= 45)" ($hookTimeout -ge 45) "timeout=$hookTimeout"
 
 $vPlugin = (Get-Content -LiteralPath (Join-Path $Plugin '.claude-plugin\plugin.json') -Raw | ConvertFrom-Json).version
 $vMarket = (Get-Content -LiteralPath (Join-Path $Repo '.claude-plugin\marketplace.json') -Raw | ConvertFrom-Json).plugins[0].version
