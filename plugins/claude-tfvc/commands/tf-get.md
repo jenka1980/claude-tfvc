@@ -5,5 +5,5 @@ argument-hint: "[path]  (defaults to the whole workspace, recursive)"
 
 Get the latest from the TFVC server for: $ARGUMENTS
 
-Resolve `tf.exe` per the `tfvc` skill, then run `tf get <path> /recursive` (default to the workspace root if no
+Run, per the `tfvc` skill's "Running tf", `tf get <path> /recursive` (default to the workspace root if no
 path is given). Report what was updated and flag any conflicts for the user to resolve.

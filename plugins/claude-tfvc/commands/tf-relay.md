@@ -1,0 +1,28 @@
+---
+description: Relay tf through your interactive Windows session when this is an SSH session without network credentials (TF30063) — status, on/off, one-time setup
+argument-hint: "[status | on | off | auto]  (default: status)"
+---
+
+Manage the relay transport that runs `tf` inside your interactive Windows session: $ARGUMENTS
+
+The relay exists for sessions without network credentials (typically an SSH key logon, for example VS Code
+Remote-SSH), where `tf.exe` fails with `TF30063: You are not authorized`. Each `tf` call is handed to a worker
+that the scheduled task `ClaudeTfvcRelay` starts in your console or RDP session. The scripts live in the `tfvc`
+skill's `scripts/` folder, next to `Find-Tf.ps1` (the skill's "Running tf" section names the folder).
+
+1. **status** (the default): run
+   `powershell -NoProfile -ExecutionPolicy Bypass -File "<skill>/scripts/Register-TfRelay.ps1" -Status`
+   and summarize the report: session kind, effective transport and where the setting comes from, task state and
+   last result, worker version, probe timing. Exit code 0 means the relay is usable.
+   - If the task is NOT registered: show the exact registration command from the report, explain that the worker
+     needs an interactive Windows session (console or RDP; a disconnected RDP session is fine), and ask whether
+     to run the registration now. Run it **only after an explicit yes**, from this session, then run `-Status`
+     again. If registration fails here, tell the user to run the same command from an RDP or console session.
+   - If the last result decodes to "not logged on interactively" (`0x00041303`): tell the user to connect over
+     RDP once and just disconnect (do not sign out), then rerun `/tf-relay`.
+2. **on** / **off** / **auto**: first do `status` (offering registration when needed), then write
+   `env.TFVC_TRANSPORT` in `<project root>/.claude/settings.local.json`: `relay` for `on`, `direct` for `off`,
+   remove the key for `auto`. Merge into the existing file (keep every other key, create the folder/file if
+   missing, keep the JSON valid with backslashes escaped). Never edit `~/.claude/settings.json`.
+3. Report the transport now in effect. It applies immediately: the hook and the skill read the file directly, and
+   Claude Code also exports it as `TFVC_TRANSPORT` for shell commands. Do not check anything in.

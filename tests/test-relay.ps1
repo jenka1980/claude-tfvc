@@ -653,6 +653,30 @@ try {
     $r = Invoke-InChild 'powershell' @{} ". '$InvokeTf'; (ConvertTo-TfRelayFailureText 0x00041303) -match 'RDP'; (ConvertTo-TfRelayFailureText 0x8007052E) -match 'ogon'; (ConvertTo-TfRelayFailureText 0x80070569) -match 'policy'; (ConvertTo-TfRelayFailureText 0x800710E0) -match 'refused'; `$null -eq (ConvertTo-TfRelayFailureText 0)"
     Check 'R19 LastTaskResult codes 0x41303 / 0x8007052E / 0x80070569 / 0x800710E0 decode to actionable text; 0 decodes to nothing' ((($r.Out -replace '\s', '') -eq 'TrueTrueTrueTrueTrue')) "out=[$($r.Out)]"
 
+    # ---- docs: skill and commands ---------------------------------------------------------------------
+    $SkillMd = Join-Path $Plugin 'skills\tfvc\SKILL.md'
+    $skillText = Get-Content -LiteralPath $SkillMd -Raw
+    $fm = [regex]::Match($skillText, '(?s)^---\r?\n(.*?)\r?\n---').Groups[1].Value
+    $descLines = @(); $inDesc = $false
+    foreach ($l in ($fm -split "`r?`n")) {
+        if ($l -match '^description:\s*>?\s*(.*)$') { $inDesc = $true; if ($Matches[1]) { $descLines += $Matches[1] }; continue }
+        if ($inDesc) { if ($l -match '^\s+(.*)$') { $descLines += $Matches[1] } else { $inDesc = $false } }
+    }
+    $desc = ($descLines -join ' ')
+    Check 'R28a SKILL.md description stays under 1024 chars and names TF30063, "not authorized", SSH and /tf-relay' `
+        (($desc.Length -lt 1024) -and ($desc -match 'TF30063') -and ($desc -match 'not authorized') -and ($desc -match 'SSH') -and ($desc -match '/tf-relay')) "len=$($desc.Length)"
+    $body = $skillText.Substring($skillText.IndexOf("`n---", 4) + 4)
+    $words = @($body -split '\s+' | Where-Object { $_ }).Count
+    Check 'R28b SKILL.md: "Running tf" with the Invoke-Tf.ps1 line replaces "Finding tf.exe"; TF30063 row; body <= 580 words' `
+        (($skillText -match '## Running tf') -and ($skillText -match 'scripts/Invoke-Tf\.ps1') -and ($skillText -notmatch '## Finding tf\.exe') -and ($skillText -match '(?m)^\|.*TF30063.*/tf-relay') -and ($words -le 580)) "words=$words"
+    foreach ($c in 'tf-status', 'tf-checkout', 'tf-checkin', 'tf-get', 'tf-undo') {
+        $t = Get-Content -LiteralPath (Join-Path $Plugin "commands\$c.md") -Raw
+        Check "R29 $c.md runs tf per the skill's Running tf (no 'Resolve tf.exe')" (($t -match 'Running tf') -and ($t -notmatch 'Resolve `tf\.exe`')) ''
+    }
+    $relayCmd = if (Test-Path -LiteralPath (Join-Path $Plugin 'commands\tf-relay.md')) { Get-Content -LiteralPath (Join-Path $Plugin 'commands\tf-relay.md') -Raw } else { '' }
+    Check 'R30 tf-relay.md: frontmatter, -Status, explicit yes before registering, settings.local.json merge, never ~/.claude/settings.json' `
+        (($relayCmd -match '(?s)^---\r?\ndescription:.*argument-hint:.*?\r?\n---') -and ($relayCmd -match 'Register-TfRelay\.ps1" -Status') -and ($relayCmd -match 'only after an explicit yes') -and ($relayCmd -match 'settings\.local\.json') -and ($relayCmd -match 'Never edit `~/\.claude/settings\.json`')) ''
+
     # ---- report (keep this anchor last; later tasks insert their checks above it) --------------------
 }
 catch { Check 'HARNESS aborted by an exception (every check after this point was skipped)' $false "$($_.Exception.Message) at $($_.InvocationInfo.ScriptLineNumber)" }
