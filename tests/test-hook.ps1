@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
   Verification harness for the claude-tfvc plugin: the auto-checkout hook, hooks.json, and the shared
   tf.exe resolver (plugins/claude-tfvc/skills/tfvc/scripts/Find-Tf.ps1).
@@ -22,8 +22,9 @@ $FindTf    = Join-Path $Plugin 'skills\tfvc\scripts\Find-Tf.ps1'
 $S         = $WorkDir
 New-Item -ItemType Directory -Path $S -Force | Out-Null
 $Log       = Join-Path $S 'tf-calls.log'
-$FakeTf    = Join-Path $S 'fake-tf.ps1'
-$FakeTf2   = Join-Path $S 'fake-tf2.ps1'
+$FakeTfSrc = Join-Path $PSScriptRoot 'FakeTf.cs'
+$FakeTf    = Join-Path $S 'fake-tf\tf.exe'      # compiled from FakeTf.cs; the hook now starts tf.exe as a process,
+$FakeTf2   = Join-Path $S 'fake-tf2\tf.exe'     # so the fakes must be real executables (a .ps1 cannot be started)
 $Exes      = [ordered]@{ powershell = (Get-Command powershell.exe).Source }
 $pwshCmd   = Get-Command pwsh.exe -ErrorAction SilentlyContinue
 if ($pwshCmd) { $Exes.pwsh = $pwshCmd.Source }
@@ -37,8 +38,22 @@ function Check([string]$Name, [bool]$Ok, [string]$Detail) {
     [void]$Results.Add([pscustomobject]@{ Result = $(if ($Ok) { 'PASS' } else { 'FAIL' }); Name = $Name; Detail = $Detail })
 }
 function Skip([string]$Name, [string]$Why) { [void]$Results.Add([pscustomobject]@{ Result = 'SKIP'; Name = $Name; Detail = $Why }) }
-function Reset-Log { Remove-Item -LiteralPath $Log -Force -ErrorAction SilentlyContinue }
-function Get-Log { if (Test-Path -LiteralPath $Log) { ((Get-Content -LiteralPath $Log -Encoding utf8) -join ' | ') } else { '' } }
+function Reset-Log { foreach ($d in (Split-Path -Parent $FakeTf), (Split-Path -Parent $FakeTf2)) { Remove-Item -LiteralPath "$d\tf-calls.log", "$d\tf-args.log" -Force -ErrorAction SilentlyContinue } }
+function Get-Log {
+    $lines = foreach ($d in (Split-Path -Parent $FakeTf), (Split-Path -Parent $FakeTf2)) {
+        if (Test-Path -LiteralPath "$d\tf-calls.log") { Get-Content -LiteralPath "$d\tf-calls.log" -Encoding utf8 }
+    }
+    return (@($lines) -join ' | ')
+}
+function New-FakeTf([string]$Path, [string]$Tag) {
+    # Compiles FakeTf.cs to $Path (once) and writes the <exe>.tag that prefixes every logged call.
+    if (-not $Csc) { return $false }
+    $dir = Split-Path -Parent $Path
+    if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    if (-not (Test-Path -LiteralPath $Path)) { & $Csc /nologo /target:exe "/out:$Path" $FakeTfSrc | Out-Null }
+    Set-Content -LiteralPath "$Path.tag" -Value $Tag -Encoding Ascii
+    return (Test-Path -LiteralPath $Path)
+}
 function New-TestFile([string]$Path, [bool]$ReadOnly) {
     $dir = Split-Path -Parent $Path
     if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
@@ -68,6 +83,7 @@ function Invoke-Hook([string]$Exe, [string]$Payload, [string]$ProjectDir = $Proj
     # $ProjectDir = '' removes CLAUDE_PROJECT_DIR so the hook has to fall back to the payload cwd / current dir.
     Reset-Log
     Set-ProjectDirEnv $ProjectDir
+    $global:OutputEncoding = New-Object System.Text.UTF8Encoding $false   # Claude Code pipes the payload as UTF-8; 5.1 defaults to ASCII ('?')
     $out = ($Payload | & $Exes[$Exe] -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $Hook 2>&1 | Out-String).Trim()
     return @{ Exit = $LASTEXITCODE; Out = $out; Log = (Get-Log) }
 }
@@ -94,8 +110,8 @@ function Invoke-FindTf([string]$Exe, [hashtable]$EnvVars, [string]$ScriptArgs) {
 }
 
 # ---- fixtures ---------------------------------------------------------------------------
-Set-Content -LiteralPath $FakeTf  -Encoding utf8 -Value 'param([Parameter(ValueFromRemainingArguments=$true)]$a) ("[" + $PSVersionTable.PSVersion.Major + "] " + ($a -join " ")) | Out-File -Append -Encoding utf8 (Join-Path $PSScriptRoot "tf-calls.log")'
-Set-Content -LiteralPath $FakeTf2 -Encoding utf8 -Value 'param([Parameter(ValueFromRemainingArguments=$true)]$a) ("[TF2] " + ($a -join " ")) | Out-File -Append -Encoding utf8 (Join-Path $PSScriptRoot "tf-calls.log")'
+$HaveFake = (New-FakeTf $FakeTf '[5]') -and (New-FakeTf $FakeTf2 '[TF2]')
+if (-not $HaveFake) { "csc.exe not found: hook cases need the compiled fake tf.exe and will be reported as SKIP" }
 $RoAscii  = Join-Path $S 'ro.txt';                    New-TestFile $RoAscii  $true
 $RoHebrew = Join-Path $S 'non-ascii-שלום\ro.txt';     New-TestFile $RoHebrew $true
 $Rw       = Join-Path $S 'rw.txt';                    New-TestFile $Rw       $false
@@ -131,7 +147,7 @@ $savedProj = $env:CLAUDE_PROJECT_DIR
 $env:TF_EXE = $FakeTf
 [Console]::InputEncoding = [System.Text.Encoding]::GetEncoding(862)
 try {
-    foreach ($exe in $Exes.Keys) {
+    foreach ($exe in $Exes.Keys) { if (-not $HaveFake) { Skip "$exe hook cases" 'csc.exe not available to build the fake tf.exe'; continue }
         $r = Invoke-Hook $exe (New-Payload $RoAscii)
         Check "$exe T1 read-only ASCII path -> tf called as 'checkout /noprompt <path>', exit 0, no output" `
             (($r.Exit -eq 0) -and $r.Log.Contains("checkout /noprompt $RoAscii") -and ($r.Out -eq '')) "exit=$($r.Exit) out=[$($r.Out)] log=[$($r.Log)]"
@@ -183,19 +199,21 @@ try {
 
     $env:CLAUDE_PLUGIN_ROOT = $Plugin
     Set-ProjectDirEnv $ProjNoCfg
-    if ($Bash) {
+    if ($Bash -and $HaveFake) {
         Reset-Log
         $out = ((New-Payload $RoAscii) | & $Bash -c $hookCmd 2>&1 | Out-String).Trim(); $code = $LASTEXITCODE; $logText = Get-Log
         Check "T4b hooks.json command works when Git Bash runs it (CLAUDE_PLUGIN_ROOT expanded by sh)" `
             (($code -eq 0) -and $logText.Contains("checkout /noprompt $RoAscii") -and ($out -eq '')) "exit=$code out=[$out] log=[$logText]"
-    } else { Skip 'T4b hooks.json command works when Git Bash runs it' 'Git Bash not installed' }
+    } else { Skip 'T4b hooks.json command works when Git Bash runs it' $(if (-not $HaveFake) { 'csc.exe not available to build the fake tf.exe' } else { 'Git Bash not installed' }) }
 
     $expanded = $hookCmd.Replace('${CLAUDE_PLUGIN_ROOT}', $Plugin)
     foreach ($exe in $Exes.Keys) {
-        Reset-Log
-        $out = ((New-Payload $RoAscii) | & $Exes[$exe] -NoProfile -Command $expanded 2>&1 | Out-String).Trim(); $code = $LASTEXITCODE; $logText = Get-Log
-        Check "$exe T4c hooks.json command works when PowerShell runs it (no Git Bash fallback)" `
-            (($code -eq 0) -and $logText.Contains("checkout /noprompt $RoAscii") -and ($out -eq '')) "exit=$code out=[$out] log=[$logText]"
+        if ($HaveFake) {
+            Reset-Log
+            $out = ((New-Payload $RoAscii) | & $Exes[$exe] -NoProfile -Command $expanded 2>&1 | Out-String).Trim(); $code = $LASTEXITCODE; $logText = Get-Log
+            Check "$exe T4c hooks.json command works when PowerShell runs it (no Git Bash fallback)" `
+                (($code -eq 0) -and $logText.Contains("checkout /noprompt $RoAscii") -and ($out -eq '')) "exit=$code out=[$out] log=[$logText]"
+        } else { Skip "$exe T4c hooks.json command works when PowerShell runs it" 'csc.exe not available to build the fake tf.exe' }
     }
 }
 finally {
