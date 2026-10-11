@@ -109,8 +109,9 @@ function Invoke-Launcher([string]$Exe, [hashtable]$EnvVars, [string[]]$TfArgs) {
         Remove-Item -LiteralPath $out, $err -Force -ErrorAction SilentlyContinue
         $cmdline = ConvertTo-CommandLine (@('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', $InvokeTf) + @($TfArgs))
         $p = Start-Process -FilePath $Exes[$Exe] -ArgumentList $cmdline -RedirectStandardOutput $out -RedirectStandardError $err -Wait -PassThru -NoNewWindow
-        $outBytes = if (Test-Path -LiteralPath $out) { [System.IO.File]::ReadAllBytes($out) } else { @() }
-        $errBytes = if (Test-Path -LiteralPath $err) { [System.IO.File]::ReadAllBytes($err) } else { @() }
+        # Plain assignments (not if-expressions): an empty byte[] returned from an expression would unroll to $null.
+        $outBytes = [byte[]]@(); if (Test-Path -LiteralPath $out) { $outBytes = [System.IO.File]::ReadAllBytes($out) }
+        $errBytes = [byte[]]@(); if (Test-Path -LiteralPath $err) { $errBytes = [System.IO.File]::ReadAllBytes($err) }
         return @{ Exit = $p.ExitCode; Out = $Utf8.GetString($outBytes); Err = $Utf8.GetString($errBytes); OutBytes = $outBytes; ErrBytes = $errBytes; Calls = @(Get-FakeCalls) }
     } finally { Restore-TestEnv $saved }
 }
@@ -118,7 +119,10 @@ function Invoke-InChild([string]$Exe, [hashtable]$EnvVars, [string]$Command) {
     # Runs $Command in a child interpreter with $EnvVars applied; returns stdout+stderr text and the exit code.
     $saved = Set-TestEnv $EnvVars
     try {
-        $out = (& $Exes[$Exe] -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command $Command 2>&1 | ForEach-Object { "$_" } | Out-String).Trim()
+        # -EncodedCommand (not -Command) so embedded double quotes survive 5.1. Under 5.1 it also serializes the
+        # progress stream as CLIXML on a redirected stderr, so progress is silenced first.
+        $encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes("`$ProgressPreference = 'SilentlyContinue'; " + $Command))
+        $out = (& $Exes[$Exe] -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand $encoded 2>&1 | ForEach-Object { "$_" } | Out-String).Trim()
         return @{ Exit = $LASTEXITCODE; Out = $out }
     } finally { Restore-TestEnv $saved }
 }
@@ -177,6 +181,72 @@ try {
         $r = Invoke-InChild $exe @{} ". '$InvokeTf'; (ConvertTo-TfRelayFailureText 267011) -match 'RDP'; (ConvertTo-TfRelayFailureText 2147943726) -match 'ogon'; (ConvertTo-TfRelayFailureText -2147023570) -match 'ogon'; (ConvertTo-TfRelayFailureText 0x800710E0) -match 'refused'; `$null -eq (ConvertTo-TfRelayFailureText 0)"
         Check "$exe R9i LastTaskResult codes decode whether given as UInt32 values or as Int32 hex literals" ((($r.Out -replace '\s', '') -eq 'TrueTrueTrueTrueTrue')) "out=[$($r.Out)]"
     }
+
+    # ---- R13 command-line quoting (CommandLineToArgvW round trip through the fake's Main) --------------
+    $HardArgs = @('plain', 'with space', 'quote"inside', 'trail\', 'trail\\', 'back\slash', '"', '', 'a b"c\', "tab`there",
+                  $Sample, '%TEMP%', '&|^<>', '/comment:He said "hi" & left', 'D:\Projects\X\')
+    $HardJson = Join-Path $S 'hard-args.json'
+    [System.IO.File]::WriteAllText($HardJson, (ConvertTo-Json -InputObject $HardArgs -Compress), $Utf8)
+    function Compare-Args([string[]]$Expected, $Got) {
+        if ($null -eq $Got) { return "no call logged" }
+        if (@($Got).Count -ne $Expected.Count) { return "count $(@($Got).Count) != $($Expected.Count): [$(@($Got) -join '|')]" }
+        for ($i = 0; $i -lt $Expected.Count; $i++) { if (@($Got)[$i] -cne $Expected[$i]) { return "arg $i got [$(@($Got)[$i])] want [$($Expected[$i])]" } }
+        return ''
+    }
+    if ($HaveFake) {
+        foreach ($exe in $Exes.Keys) {
+            Reset-FakeLog
+            $r = Invoke-InChild $exe $DirectEnv ". '$InvokeTf'; `$a = [string[]](Get-Content -LiteralPath '$HardJson' -Raw -Encoding UTF8 | ConvertFrom-Json); `$x = Invoke-TfDirect -Tf '$FakeTf' -Arguments `$a -WorkingDirectory '$S' -Capture; `$x.ExitCode"
+            $diff = Compare-Args $HardArgs @(Get-FakeCalls)[0]
+            Check "$exe R13 ConvertTo-CommandLine round-trips spaces, quotes, trailing backslashes, empty, Hebrew, Cyrillic, %, &" ($diff -eq '' -and $r.Out -match '(?m)^0$') "$diff exit=[$($r.Out)]"
+        }
+    } else { Skip 'R13 quoting round trip' 'no fake tf.exe' }
+
+    # ---- R1 / R3 / R14 / R15 / R32 direct mode through the real command line (powershell -File) ----------
+    if ($HaveFake) {
+        foreach ($exe in $Exes.Keys) {
+            foreach ($code in 0, 1, 100) {
+                $r = Invoke-Launcher $exe $DirectEnv @('status', 'a b', "/exit:$code", '/stdout:hello out', '/stderr:oops err')
+                Check "$exe R1 direct: exit $code passes through, stdout and stderr reach the caller, args reach tf" `
+                    (($r.Exit -eq $code) -and ($r.Out.Trim() -eq 'hello out') -and ($r.Err -match 'oops err') -and ($r.Calls.Count -eq 1) -and ($r.Calls[0][1] -eq 'a b')) "exit=$($r.Exit) out=[$($r.Out.Trim())] err=[$($r.Err.Trim())] args=[$($r.Calls[0] -join '|')]"
+            }
+
+            $core = @('status', 'with space', 'trail\', 'D:\Projects\X\', $Sample, '%TEMP%', '&|^<>', '-noprompt', '/noprompt')
+            $r = Invoke-Launcher $exe $DirectEnv $core
+            $diff = Compare-Args $core $r.Calls[0]
+            Check "$exe R3 powershell -File passes spaces, trailing backslashes, Hebrew, Cyrillic, %, & and both option styles unchanged" ($diff -eq '') $diff
+
+            $quoted = @('checkin', '/comment:He said "hi" & left', 'file.cs')
+            $r = Invoke-Launcher $exe $DirectEnv $quoted
+            $diff = Compare-Args $quoted $r.Calls[0]
+            Check "$exe R3q an embedded double quote survives powershell -File (if this fails, document the limitation in SKILL.md, Task 10)" ($diff -eq '') $diff
+
+            $r = Invoke-Launcher $exe $DirectEnv @('status', '/stderr:TF30063: You are not authorized to access http://tfs:8080/tfs.')
+            Check "$exe R15a direct + auto + TF30063 on stderr -> the original line plus one /tf-relay hint line" `
+                (($r.Err -match 'TF30063: You are not authorized') -and ($r.Err -match 'Run /tf-relay')) "err=[$($r.Err.Trim())]"
+
+            $r = Invoke-Launcher $exe (Merge-Env $DirectEnv @{ TFVC_TRANSPORT = 'direct' }) @('status', '/stderr:TF30063: nope')
+            Check "$exe R15b forced direct -> no hint even on TF30063" (($r.Err -match 'TF30063') -and ($r.Err -notmatch '/tf-relay')) "err=[$($r.Err.Trim())]"
+
+            $r = Invoke-Launcher $exe $DirectEnv @('status', '/stderr:TF10140: no mapping')
+            Check "$exe R15c other errors -> stderr relayed, no hint" (($r.Err -match 'TF10140') -and ($r.Err -notmatch '/tf-relay')) "err=[$($r.Err.Trim())]"
+
+            $r = Invoke-Launcher $exe $DirectEnv @('get', '/big')
+            Check "$exe R32a direct streaming: 300 KB on each stream, no deadlock, nothing lost" (($r.Exit -eq 0) -and ($r.OutBytes.Length -eq 303000) -and ($r.ErrBytes.Length -eq 303000)) "exit=$($r.Exit) out=$($r.OutBytes.Length) err=$($r.ErrBytes.Length)"
+
+            $r = Invoke-InChild $exe $DirectEnv ". '$InvokeTf'; `$x = Invoke-TfDirect -Tf '$FakeTf' -Arguments @('get','/big') -WorkingDirectory '$S' -Capture; `"`$(`$x.ExitCode)|`$(`$x.StdOut.Length)|`$(`$x.StdErr.Length)`""
+            Check "$exe R32b direct capture: both streams read concurrently, 300 KB each" ($r.Out -match '(?m)^0\|303000\|303000$') "out=[$($r.Out)]"
+        }
+
+        $PfEmpty = Join-Path $S 'pf-empty'; New-Item -ItemType Directory -Path $PfEmpty -Force | Out-Null
+        $MinPath = "$env:SystemRoot\System32;$env:SystemRoot;$env:SystemRoot\System32\WindowsPowerShell\v1.0"
+        foreach ($exe in $Exes.Keys) {
+            # ProgramFiles must be overridden INSIDE the child: Windows re-derives it for every new 64-bit process.
+            $prelude = "Remove-Item Env:\TF_EXE -ErrorAction SilentlyContinue; `$env:PATH = '$MinPath'; `$env:ProgramFiles = '$PfEmpty'; `${env:ProgramFiles(x86)} = '$PfEmpty'; `$env:CLAUDE_PROJECT_DIR = '$ProjNone'"
+            $r = Invoke-InChild $exe @{} "$prelude; & '$InvokeTf' status; exit `$LASTEXITCODE"
+            Check "$exe R14 no tf.exe anywhere -> exit 127 and a one-line explanation" (($r.Exit -eq 127) -and ($r.Out -match 'no tf.exe found')) "exit=$($r.Exit) out=[$($r.Out)]"
+        }
+    } else { Skip 'R1/R3/R14/R15/R32 direct mode' 'no fake tf.exe' }
 
     # ---- report (keep this anchor last; later tasks insert their checks above it) --------------------
 }

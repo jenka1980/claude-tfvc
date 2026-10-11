@@ -123,3 +123,114 @@ function Resolve-TfTransport {
     }
     [pscustomobject]@{ Transport = $transport; Setting = $setting; Source = $source; Remote = $remote; TaskRegistered = $registered }
 }
+
+function ConvertTo-CommandLine {
+    # Joins arguments into one Windows command line that CommandLineToArgvW (and every .NET Main) parses back
+    # into exactly the same strings. An argument is used as-is when it is non-empty and has no space, tab,
+    # newline or double quote; otherwise it is quoted, N backslashes before a double quote become 2N+1
+    # backslashes plus \", and N trailing backslashes become 2N. .NET Framework's ProcessStartInfo has no
+    # ArgumentList, so this is by hand. IDENTICAL COPY in Tf-RelayWorker.ps1 (installed as a single file).
+    param([string[]]$Arguments)
+    $parts = foreach ($arg in @($Arguments)) {
+        $a = "$arg"
+        if ($a.Length -gt 0 -and $a -notmatch '[\s"]') { $a; continue }
+        $sb = New-Object System.Text.StringBuilder
+        [void]$sb.Append('"')
+        $slashes = 0
+        foreach ($ch in $a.ToCharArray()) {
+            if ($ch -eq '\') { $slashes++; continue }
+            if ($ch -eq '"') { [void]$sb.Append('\', $slashes * 2 + 1).Append('"') }
+            else { [void]$sb.Append('\', $slashes).Append($ch) }
+            $slashes = 0
+        }
+        [void]$sb.Append('\', $slashes * 2).Append('"')
+        $sb.ToString()
+    }
+    return (@($parts) -join ' ')
+}
+
+function New-TfResult {
+    param([int]$ExitCode, [string]$StdOut, [string]$StdErr, [string]$Transport, [string]$Diagnostic)
+    [pscustomobject]@{ ExitCode = $ExitCode; StdOut = $StdOut; StdErr = $StdErr; Transport = $Transport; Diagnostic = $Diagnostic }
+}
+
+function Invoke-TfDirect {
+    # Runs tf.exe as a child process. Streaming (default): stdout and stdin are inherited handles, stderr is
+    # copied byte for byte to our stderr and kept for the TF30063 check. -Capture: both streams are read
+    # concurrently (no pipe deadlock) and decoded from the system ANSI code page.
+    param([string]$Tf, [string[]]$Arguments, [string]$WorkingDirectory, [switch]$Capture)
+    $ansi = Get-TfAnsiEncoding
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $Tf
+    $psi.Arguments = ConvertTo-CommandLine $Arguments
+    $psi.UseShellExecute = $false
+    $psi.WorkingDirectory = $WorkingDirectory
+    $psi.RedirectStandardError = $true
+    $psi.RedirectStandardOutput = [bool]$Capture
+    $psi.StandardErrorEncoding = $ansi
+    if ($Capture) { $psi.StandardOutputEncoding = $ansi }
+    try { $p = [System.Diagnostics.Process]::Start($psi) }
+    catch { return New-TfResult -ExitCode 127 -Transport 'direct' -Diagnostic "claude-tfvc: cannot start '$Tf': $($_.Exception.Message)" }
+    if ($Capture) {
+        $outTask = $p.StandardOutput.ReadToEndAsync()
+        $errTask = $p.StandardError.ReadToEndAsync()
+        $p.WaitForExit()
+        return New-TfResult -ExitCode $p.ExitCode -StdOut $outTask.Result -StdErr $errTask.Result -Transport 'direct'
+    }
+    $buffer = New-Object byte[] 4096
+    $kept   = New-Object System.IO.MemoryStream
+    $ours   = [Console]::OpenStandardError()
+    $theirs = $p.StandardError.BaseStream
+    while (($n = $theirs.Read($buffer, 0, $buffer.Length)) -gt 0) {
+        $ours.Write($buffer, 0, $n); $ours.Flush()
+        $kept.Write($buffer, 0, $n)
+    }
+    $p.WaitForExit()
+    return New-TfResult -ExitCode $p.ExitCode -StdErr $ansi.GetString($kept.ToArray()) -Transport 'direct'
+}
+
+function Invoke-TfRelay {
+    # Replaced by the real relay client in the next step of the work (Task 7 of the plan).
+    param([string]$Tf, [string[]]$Arguments, [string]$WorkingDirectory, [int]$TimeoutSec = 600, [int]$PickupTimeoutSec = 30)
+    return New-TfResult -ExitCode 120 -Transport 'relay' -Diagnostic 'claude-tfvc: relay client not available in this build'
+}
+
+function Invoke-Tf {
+    # Resolves tf.exe (Find-Tf.ps1), picks the transport, runs tf, returns { ExitCode, StdOut, StdErr, Transport, Diagnostic }.
+    # Without -Capture, direct mode streams to the console and StdOut is $null. The hook uses -Capture.
+    param([string[]]$Arguments, [string]$ProjectDir, [string]$WorkingDirectory, [switch]$Capture, [int]$TimeoutSec = 600, [int]$PickupTimeoutSec = 30)
+    if (-not $ProjectDir) { $ProjectDir = $env:CLAUDE_PROJECT_DIR }
+    if (-not $ProjectDir) { $ProjectDir = (Get-Location).Path }
+    if (-not $WorkingDirectory) { $WorkingDirectory = (Get-Location).Path }
+    $tf = Resolve-TfExe -ProjectDir $ProjectDir
+    if (-not $tf) {
+        return New-TfResult -ExitCode 127 -Transport 'none' -Diagnostic 'claude-tfvc: no tf.exe found (checked the project .claude\settings*.json env.TF_EXE, TF_EXE, PATH, vswhere and the Visual Studio folders); install Team Explorer or pick one with /tf-select'
+    }
+    $choice = Resolve-TfTransport -ProjectDir $ProjectDir
+    if ($choice.Transport -eq 'relay') {
+        if (-not (Test-TfRelayWorkerAlive (Get-TfRelayPaths)) -and -not (Test-TfRelayTaskRegistered)) {
+            return New-TfResult -ExitCode 120 -Transport 'relay' -Diagnostic ('claude-tfvc: ' + (Get-TfRegistrationHint))
+        }
+        return Invoke-TfRelay -Tf $tf -Arguments $Arguments -WorkingDirectory $WorkingDirectory -TimeoutSec $TimeoutSec -PickupTimeoutSec $PickupTimeoutSec
+    }
+    $r = Invoke-TfDirect -Tf $tf -Arguments $Arguments -WorkingDirectory $WorkingDirectory -Capture:$Capture
+    if ($choice.Setting -eq 'auto' -and "$($r.StdErr)" -match 'TF30063') {
+        $hint = 'claude-tfvc: TF30063 usually means this session has no network credentials (SSH key logon). Run /tf-relay to route tf through your interactive Windows session.'
+        if ($Capture) { $r.Diagnostic = $hint } else { [Console]::Error.WriteLine($hint) }
+    }
+    return $r
+}
+
+if ($MyInvocation.InvocationName -ne '.') {
+    $timeout = 600
+    if ($env:TFVC_RELAY_TIMEOUT -match '^\d+$') { $timeout = [int]$env:TFVC_RELAY_TIMEOUT }
+    $result = Invoke-Tf -Arguments $args -TimeoutSec $timeout
+    $utf8 = New-Object System.Text.UTF8Encoding $false
+    if ($result.Transport -eq 'relay') {
+        # Relay output is Unicode already (the worker decoded tf's ANSI bytes); hand it to Claude Code as UTF-8.
+        if ($result.StdOut) { $w = New-Object System.IO.StreamWriter([Console]::OpenStandardOutput(), $utf8); $w.Write($result.StdOut); $w.Flush() }
+        if ($result.StdErr) { $w = New-Object System.IO.StreamWriter([Console]::OpenStandardError(), $utf8); $w.Write($result.StdErr); $w.Flush() }
+    }
+    if ($result.Diagnostic) { $w = New-Object System.IO.StreamWriter([Console]::OpenStandardError(), $utf8); $w.WriteLine($result.Diagnostic); $w.Flush() }
+    exit $result.ExitCode
+}
