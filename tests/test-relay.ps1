@@ -393,7 +393,18 @@ try {
         $resGood = Get-Content -LiteralPath (Join-Path $Queue "$($good.id).res.json") -Raw | ConvertFrom-Json
         Check 'R33 a corrupt .req.json is deleted, a foreign file is ignored, the good request is still served' `
             (($resGood.stdout.Trim() -eq 'good') -and (-not (Test-Path -LiteralPath (Join-Path $Queue 'bad.req.json'))) -and (-not (Test-Path -LiteralPath (Join-Path $Queue 'bad.run.json'))) -and (Test-Path -LiteralPath (Join-Path $Queue 'garbage.txt'))) "good=[$($resGood.stdout)]"
-    } else { Skip 'R22/R23/R24/R33 worker loop' 'no fake tf.exe' }
+
+        Reset-Relay; Reset-FakeLog
+        $stale = New-Request @('status', '/stdout:stale'); Write-QueuedRequest $stale 'run' | Out-Null; Write-QueuedRequest $stale 'req' | Out-Null   # .run.json already exists for this id: the claim rename must fail
+        Start-Sleep -Milliseconds 1100
+        $good = New-Request @('status', '/stdout:good'); Write-QueuedRequest $good | Out-Null
+        $proc = Start-WorkerChild; $exited = $proc.WaitForExit(15000)
+        $log = @(Get-WorkerLog)
+        $resGood2 = if (Test-Path -LiteralPath (Join-Path $Queue "$($good.id).res.json")) { Get-Content -LiteralPath (Join-Path $Queue "$($good.id).res.json") -Raw | ConvertFrom-Json } else { $null }
+        Check 'R37 a request whose claim rename fails is logged once and skipped; the next request is served and the worker exits after the linger (no spin)' `
+            ($exited -and ($resGood2 -and ($resGood2.stdout.Trim() -eq 'good')) -and (@($log | Where-Object { $_ -match 'claim failed' }).Count -eq 1) -and ($log[-1] -match 'stop: idle')) "exited=$exited good=[$(if ($resGood2) { $resGood2.stdout.Trim() })] log=[$($log -join ' / ')]"
+        if (-not $exited) { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }
+    } else { Skip 'R22/R23/R24/R33/R37 worker loop' 'no fake tf.exe' }
 
     # ---- report (keep this anchor last; later tasks insert their checks above it) --------------------
 }

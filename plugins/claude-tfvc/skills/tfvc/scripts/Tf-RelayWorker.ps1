@@ -183,18 +183,29 @@ function Start-RelayWorker {
         $born = [DateTime]::UtcNow
         $idleSince = $born
         $lastSweep = [DateTime]::MinValue
+        $skip = @{}   # names of requests this run will not retry
         while ($true) {
             $now = [DateTime]::UtcNow
             if (($now - $lastSweep).TotalSeconds -ge 60) { Remove-RelayOrphans; $lastSweep = $now }
             if (($now - $born).TotalMinutes -ge $RelayMaxLifeMin) { Write-RelayLog 'stop: life limit'; break }
             $next = Get-ChildItem -LiteralPath $RelayQueue -Filter '*.req.json' -File -ErrorAction SilentlyContinue |
+                    Where-Object { -not $skip.ContainsKey($_.Name) } |
                     Sort-Object LastWriteTimeUtc, Name | Select-Object -First 1
             if ($next) {
                 $runPath = $next.FullName -replace '\.req\.json$', '.run.json'
-                try { [System.IO.File]::Move($next.FullName, $runPath) } catch { continue }   # claimed by another instance
-                Invoke-RelayRequest -RunPath $runPath
-                $idleSince = [DateTime]::UtcNow
-                continue
+                $claimed = $false
+                try { [System.IO.File]::Move($next.FullName, $runPath); $claimed = $true }
+                catch {
+                    # stale .run.json or sharing violation; skipped for this run, the sweep removes stale files after an hour
+                    Write-RelayLog "claim failed $($next.Name): $($_.Exception.Message)"
+                    $skip[$next.Name] = $true
+                    $idleSince = [DateTime]::UtcNow
+                }
+                if ($claimed) {
+                    Invoke-RelayRequest -RunPath $runPath
+                    $idleSince = [DateTime]::UtcNow
+                    continue
+                }
             }
             if (($now - $idleSince).TotalSeconds -ge $RelayLingerSec) { Write-RelayLog 'stop: idle'; break }
             Start-Sleep -Milliseconds 200
