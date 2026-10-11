@@ -90,8 +90,8 @@ calls `tf checkout` — it never checks in.
 **Symptom:** Claude Code runs over SSH (for example VS Code Remote-SSH with a key) and every `tf` call fails with
 `TF30063: You are not authorized to access <server>\<collection>`; the auto-checkout hook silently does nothing and
 edits fail with "access denied". An SSH key logon is a *network* logon without delegable Windows credentials, so an
-on-prem TFS with Windows authentication rejects the client. (An SSH logon with a password carries credentials, so
-the relay is unnecessary there.)
+on-prem TFS with Windows authentication rejects the client. (An SSH logon with a password usually carries
+credentials, so the relay is then unnecessary.)
 
 **How it works:** the plugin runs `tf` through one launcher, `skills/tfvc/scripts/Invoke-Tf.ps1`. In a remote
 session it writes the request to a per-user queue (`%LOCALAPPDATA%\claude-tfvc\relay\queue`), starts the scheduled
@@ -118,6 +118,9 @@ Windows interactively" and the hook lets the edit proceed with that explanation.
 overhead per call, and almost none while the worker lingers after a burst of calls.
 
 **Security:** the worker starts only an executable named `tf.exe` with a valid Microsoft Authenticode signature,
+located under Program Files or a Visual Studio installation that `vswhere` reports (to allow another folder, list
+it in `CLAUDE_TFVC_RELAY_TRUSTED_ROOTS`, semicolon-separated, in your own Windows environment: the worker reads its
+own environment, so a project or a request cannot set it),
 only from an argument array (no shell, no string interpretation), with `/noprompt` forced and stdin closed. The
 queue, lock, log and worker copy live in your profile with its default ACL. Nothing stores or transmits a password
 or token. The log holds timestamps, request ids, the `tf` verb, exit codes and durations, never comments or output.
@@ -129,6 +132,7 @@ stable you can make Claude Code ask before them:
     "PowerShell(*Invoke-Tf.ps1*checkin*)", "PowerShell(*Invoke-Tf.ps1*undo*)" ] } }
 ```
 `*` may appear anywhere in a rule, and `ask` rules still prompt even when a hook allows the call.
+These rules match the launcher invocation only; they are a prompt, not a security boundary around tf.exe.
 
 **Diagnostics:** `/tf-relay` (or `Register-TfRelay.ps1 -Status`) prints the session kind, the effective transport,
 the task state with `LastTaskResult` decoded, the worker version, queue counts and a timed probe.
@@ -149,7 +153,7 @@ Check your type with `tf workspaces /collection:<url>`.
 - `tests\test-hook.ps1` exercises the hook, `hooks.json` and the resolver under Windows PowerShell 5.1 and pwsh
   (console code page forced to 862, fake `tf`, fake Visual Studio trees, fake projects):
   `powershell -NoProfile -ExecutionPolicy Bypass -File tests\test-hook.ps1`
-  (it now also needs `csc.exe`, which ships with .NET Framework 4.x, to compile the fake `tf.exe`)
+  (it needs `csc.exe`, which ships with .NET Framework 4.x, to compile the fake `tf.exe`)
 - `tests\test-relay.ps1` exercises the launcher (direct and relay), the worker, `Register-TfRelay.ps1 -Status`, the hook in relay mode and the docs, without touching the scheduler (a child worker and a fake `tf.exe` compiled from `tests\FakeTf.cs`): `powershell -NoProfile -ExecutionPolicy Bypass -File tests\test-relay.ps1`
 - `tests\skill-evals\` holds pressure-scenario evals for the skill (run with and without the skill in a sandbox
   with a fake `tf.exe`); see its README.

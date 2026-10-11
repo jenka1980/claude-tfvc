@@ -4,6 +4,8 @@
 #   * SAFE everywhere - in non-TFVC / git projects this is a near-instant no-op.
 #   * NEVER blocks an edit. We always exit 0 (allow). When checkout fails we let the edit proceed and hand
 #     Claude the reason as additionalContext (the launcher supplies the TF30063 -> /tf-relay hint where it applies).
+#   * Silent when there is no tf.exe at all (transport 'none'): read-only files without any tf.exe are not a
+#     TFVC project, so there is nothing to say (as in 0.3.0).
 #   * Only acts when the target file is READ-ONLY, which is TFVC's "not checked out" signal. Normal (writable)
 #     files are skipped instantly.
 #   * Runs on Windows PowerShell 5.1 (built into every Windows) as well as PowerShell 7.
@@ -31,7 +33,7 @@ try {
         # /noprompt: fail fast instead of opening a credential dialog behind the terminal.
         # 15 s to be picked up, 20 s in all: well inside the 45 s hook timeout in hooks.json.
         $r = Invoke-Tf -Arguments @('checkout', '/noprompt', $file) -ProjectDir $projectDir -WorkingDirectory $projectDir -Capture -PickupTimeoutSec 15 -TimeoutSec 20
-        if ($r.ExitCode -ne 0) {
+        if ($r.ExitCode -ne 0 -and $r.Transport -ne 'none') {
             $why = ((@($r.Diagnostic, $r.StdErr, $r.StdOut) | Where-Object { "$_".Trim() }) -join ' ') -replace '\s+', ' '
             if ($why.Length -gt 600) { $why = $why.Substring(0, 600) + '...' }
             $msg = "claude-tfvc: tf checkout of $file failed ($($r.Transport), exit $($r.ExitCode)): $why"

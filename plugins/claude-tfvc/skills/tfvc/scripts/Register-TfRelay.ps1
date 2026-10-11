@@ -61,22 +61,25 @@ function Get-TfRelayStatusReport {
     $remote = Test-TfRemoteSession
     $choice = Resolve-TfTransport -ProjectDir $env:CLAUDE_PROJECT_DIR
     $info = Get-TfRelayTaskInfo
-    $registered = if ($info) { $info.Registered } else { Test-TfRelayTaskRegistered }
+    # A task registered for another user is unusable here (Invoke-Tf ignores it too): report it, offer re-registration.
+    $registered = if ($info) { $info.Registered -and (Test-TfRelayPrincipalMatches $info.UserId) } else { Test-TfRelayTaskRegistered }
     [void]$lines.Add("Session:    " + $(if ($remote) { 'remote (SSH_CONNECTION/SSH_CLIENT set)' } else { 'local (no SSH variables)' }))
     [void]$lines.Add("Transport:  $($choice.Transport)  (TFVC_TRANSPORT=$($choice.Setting) from $($choice.Source))")
     if ($info) {
-        if ($info.Registered) { [void]$lines.Add("Task:       registered; $(Format-TfTaskState $info); last run $($info.LastRunTime)") }
+        if ($info.Registered) {
+            [void]$lines.Add("Task:       registered for $($info.UserId); $(Format-TfTaskState $info); last run $($info.LastRunTime)")
+            if (-not $registered) { $ok = $false }
+        }
         else { [void]$lines.Add('Task:       NOT registered'); $ok = $false }
     } else {
         [void]$lines.Add("Task:       " + $(if ($registered) { 'registered' } else { 'NOT registered' }) + " (simulated by CLAUDE_TFVC_RELAY_LAUNCH=$env:CLAUDE_TFVC_RELAY_LAUNCH)")
         if (-not $registered) { $ok = $false }
     }
     if (Test-Path -LiteralPath $Paths.Worker -PathType Leaf) {
-        $verText = if (Test-Path -LiteralPath $Paths.Version) { Get-Content -LiteralPath $Paths.Version -Raw } else { '' }
-        $ver = [regex]::Match($verText, '(?m)^version=(.+)$').Groups[1].Value.Trim()
-        $sha = [regex]::Match($verText, '(?m)^sha256=(\w+)').Groups[1].Value
-        $same = ($sha -eq (Get-FileHash -LiteralPath $Paths.Source -Algorithm SHA256).Hash)
-        [void]$lines.Add("Worker:     installed $ver " + $(if ($same) { '(matches the plugin)' } else { "(plugin is $(Get-TfPluginVersion); refreshed on the next call)" }))
+        $installed = Read-TfWorkerVersion -Paths $Paths
+        $pluginVersion = Get-TfPluginVersion
+        $same = ($installed.Sha256 -eq (Get-FileHash -LiteralPath $Paths.Source -Algorithm SHA256).Hash) -and ($installed.Version -eq $pluginVersion)
+        [void]$lines.Add("Worker:     installed $($installed.Version) " + $(if ($same) { '(matches the plugin)' } else { "(plugin is $pluginVersion; refreshed on the next call)" }))
     } else { [void]$lines.Add('Worker:     not installed yet (installed on the first relay call)') }
     $counts = foreach ($kind in 'req', 'run', 'res') { @(Get-ChildItem -LiteralPath $Paths.Queue -Filter "*.$kind.json" -ErrorAction SilentlyContinue).Count }
     [void]$lines.Add("Queue:      $($Paths.Queue)  ($($counts[0]) waiting, $($counts[1]) running, $($counts[2]) answered)")

@@ -49,11 +49,14 @@ function Get-Log {
     return (@($lines) -join ' | ')
 }
 function New-FakeTf([string]$Path, [string]$Tag) {
-    # Compiles FakeTf.cs to $Path (once) and writes the <exe>.tag that prefixes every logged call.
+    # Compiles FakeTf.cs to $Path (when missing or older than the source) and writes the <exe>.tag that prefixes
+    # every logged call.
     if (-not $Csc) { return $false }
     $dir = Split-Path -Parent $Path
     if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
-    if (-not (Test-Path -LiteralPath $Path)) { & $Csc /nologo /target:exe "/out:$Path" $FakeTfSrc | Out-Null }
+    if (-not (Test-Path -LiteralPath $Path) -or (Get-Item -LiteralPath $FakeTfSrc).LastWriteTimeUtc -gt (Get-Item -LiteralPath $Path).LastWriteTimeUtc) {
+        & $Csc /nologo /target:exe "/out:$Path" $FakeTfSrc | Out-Null
+    }
     Set-Content -LiteralPath "$Path.tag" -Value $Tag -Encoding Ascii
     return (Test-Path -LiteralPath $Path)
 }

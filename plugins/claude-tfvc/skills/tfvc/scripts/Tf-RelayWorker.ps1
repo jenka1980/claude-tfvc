@@ -7,10 +7,13 @@
   Queue: <root>\queue\<id>.req.json (waiting) -> <id>.run.json (claimed) -> <id>.res.json (answered), where
   <root> is %LOCALAPPDATA%\claude-tfvc\relay or CLAUDE_TFVC_RELAY_ROOT (test seam).
   Rules: one worker at a time (worker.lock held with FileShare.None); oldest request first; an expired request
-  is deleted unrun; only an executable named tf.exe with a valid Microsoft Authenticode signature is started
-  (CLAUDE_TFVC_RELAY_ALLOW_UNSIGNED=1 in THIS process's environment is the test bypass; a request cannot set it);
+  is deleted unrun; only an executable named tf.exe, under Program Files, a Visual Studio installation (vswhere)
+  or a folder listed in CLAUDE_TFVC_RELAY_TRUSTED_ROOTS (semicolon-separated), with a valid Microsoft Authenticode
+  signature is started (CLAUDE_TFVC_RELAY_ALLOW_UNSIGNED=1 is the test bypass for the signature only; both
+  variables are read from THIS process's environment, a request cannot set them);
   /noprompt is always present; stdin is closed; output is decoded from the system ANSI code page; the log never
-  records comments, further arguments, paths or output. The worker lingers CLAUDE_TFVC_RELAY_LINGER_SEC (default
+  records comments, further arguments, paths or output (a first argument that is not a plain word is logged as
+  '?'). The worker lingers CLAUDE_TFVC_RELAY_LINGER_SEC (default
   15) after the queue empties and stops after 50 minutes of life (the task's limit is 1 hour).
   Installed as ONE file by Invoke-Tf.ps1: it must not dot-source anything. Dot-sourcing it only defines the
   functions (tests). Windows PowerShell 5.1; keep this file pure ASCII.
@@ -32,13 +35,44 @@ if (Test-Path -LiteralPath $versionFile) {
     if ($m.Success) { $WorkerVersion = $m.Groups[1].Value.Trim() }
 }
 $VerifiedTf = @{}
+$VsInstallRoots = @{}   # 'list' -> the vswhere installationPath values, queried once per worker life
 
 function Get-AnsiEncoding {
-    # The system ANSI code page (what tf.exe writes when redirected). Exact on Windows PowerShell 5.1.
+    # The system ANSI code page (what tf.exe writes when redirected). [Text.Encoding]::Default on Windows
+    # PowerShell 5.1; GetEncoding(0) on pwsh, where Default is UTF-8.
     if ($PSVersionTable.PSEdition -eq 'Core') {
-        try { return [System.Text.Encoding]::GetEncoding([System.Globalization.CultureInfo]::CurrentCulture.TextInfo.ANSICodePage) } catch { }
+        try { return [System.Text.Encoding]::GetEncoding(0) } catch { }
     }
     return [System.Text.Encoding]::Default
+}
+
+function Get-TrustedTfRoots {
+    # Where a tf.exe may live: both Program Files folders, every Visual Studio installation vswhere knows, and the
+    # semicolon-separated CLAUDE_TFVC_RELAY_TRUSTED_ROOTS of this process (the user's own environment).
+    if (-not $VsInstallRoots.ContainsKey('list')) {
+        $found = @()
+        foreach ($base in @(@($env:ProgramFiles, ${env:ProgramFiles(x86)}) | Where-Object { $_ })) {
+            $vswhere = Join-Path $base 'Microsoft Visual Studio\Installer\vswhere.exe'
+            if (Test-Path -LiteralPath $vswhere -PathType Leaf) {
+                try { $found = @(& $vswhere -all -prerelease -products * -property installationPath 2>$null | Where-Object { $_ }) } catch { }
+                break
+            }
+        }
+        $VsInstallRoots['list'] = $found
+    }
+    $roots = @($env:ProgramFiles, ${env:ProgramFiles(x86)}) + @($VsInstallRoots['list']) + @("$env:CLAUDE_TFVC_RELAY_TRUSTED_ROOTS" -split ';')
+    return @($roots | ForEach-Object { "$_".Trim() } | Where-Object { $_ })
+}
+
+function Test-TrustedTfLocation {
+    # $true when the full path lies under one of Get-TrustedTfRoots (case-insensitive, whole folder names).
+    param([string]$FullPath)
+    foreach ($root in Get-TrustedTfRoots) {
+        try { $r = [System.IO.Path]::GetFullPath($root) } catch { continue }
+        if (-not $r.EndsWith('\')) { $r += '\' }
+        if ($FullPath.StartsWith($r, [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
+    }
+    return $false
 }
 
 function ConvertTo-CommandLine {
@@ -86,20 +120,22 @@ function Write-JsonAtomic {
 }
 
 function Test-TfExecutable {
-    # $null when the file may run, otherwise the refusal text. Only tf.exe, only Microsoft-signed, only an absolute
-    # path; the verdict is cached per path and file version (a replaced file is checked again).
+    # $null when the file may run, otherwise the refusal text. Only tf.exe, only an absolute path, only from a
+    # trusted location, only Microsoft-signed; the signature verdict is cached per path and file version (a
+    # replaced file is checked again).
     param([string]$Path)
     if ([System.IO.Path]::GetFileName($Path) -ine 'tf.exe') { return "refusing to run '$Path': the executable must be named tf.exe" }
     if (-not [System.IO.Path]::IsPathRooted($Path)) { return "refusing to run '$Path': the tf.exe path must be absolute" }
     $Path = [System.IO.Path]::GetFullPath($Path)
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return "tf.exe not found at '$Path'" }
+    if (-not (Test-TrustedTfLocation $Path)) { return "refusing to run '$Path': tf.exe must live under Program Files or a Visual Studio installation (set CLAUDE_TFVC_RELAY_TRUSTED_ROOTS in your own environment to allow another folder)" }
     if ($env:CLAUDE_TFVC_RELAY_ALLOW_UNSIGNED -eq '1') { return $null }
     $item = Get-Item -LiteralPath $Path
     $key = "$Path|$($item.LastWriteTimeUtc.Ticks)|$($item.Length)"
     if ($VerifiedTf.ContainsKey($key)) { return $VerifiedTf[$key] }
     $sig = Get-AuthenticodeSignature -LiteralPath $Path
     $verdict = $null
-    if ($sig.Status -ne 'Valid' -or "$($sig.SignerCertificate.Subject)" -notmatch 'O=Microsoft Corporation') {
+    if ($sig.Status -ne 'Valid' -or "$($sig.SignerCertificate.Subject)" -notmatch '(^|, )O=Microsoft Corporation(,|$)') {
         $verdict = "refusing to run '$Path': not a Microsoft-signed tf.exe (signature status: $($sig.Status))"
     }
     $VerifiedTf[$key] = $verdict
@@ -118,7 +154,7 @@ function Invoke-RelayRequest {
         catch { Write-RelayLog "$id malformed request, deleted"; Remove-Item -LiteralPath $RunPath -Force -ErrorAction SilentlyContinue; return }
         if ($null -eq $req) { Write-RelayLog "$id malformed request, deleted"; Remove-Item -LiteralPath $RunPath -Force -ErrorAction SilentlyContinue; return }
         $argList = @(@($req.args) | ForEach-Object { "$_" })
-        if ($argList.Count -gt 0) { $verb = $argList[0] }
+        if ($argList.Count -gt 0 -and $argList[0] -match '^[A-Za-z]+$') { $verb = $argList[0] }   # a path or anything else stays '?'
         if ($req.protocol -ne $RelayProtocol) {
             $res.error = "protocol $($req.protocol) is not supported by relay worker $WorkerVersion (protocol $RelayProtocol); update the worker by running any tf command from the plugin or Register-TfRelay.ps1"
         }

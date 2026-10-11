@@ -28,9 +28,10 @@ $TfvcRelayProtocol = 1
 
 function Get-TfAnsiEncoding {
     # The system ANSI code page: what tf.exe uses when its output is redirected. [Text.Encoding]::Default is
-    # exactly that on Windows PowerShell 5.1 (.NET Framework) but UTF-8 on pwsh, hence the culture fallback.
+    # exactly that on Windows PowerShell 5.1 (.NET Framework) but UTF-8 on pwsh; GetEncoding(0) returns the
+    # system ANSI page on both (pwsh registers the code-page provider), unlike the culture's page.
     if ($PSVersionTable.PSEdition -eq 'Core') {
-        try { return [System.Text.Encoding]::GetEncoding([System.Globalization.CultureInfo]::CurrentCulture.TextInfo.ANSICodePage) } catch { }
+        try { return [System.Text.Encoding]::GetEncoding(0) } catch { }
     }
     return [System.Text.Encoding]::Default
 }
@@ -73,14 +74,29 @@ function Test-TfRelayWorkerAlive {
     catch { return $false }
 }
 
+function Test-TfRelayPrincipalMatches {
+    # The task must run as the current user: its principal, with any DOMAIN\ or @domain part stripped, equals
+    # USERNAME (case-insensitive). An empty principal (the scheduler did not say) is accepted.
+    param([string]$UserId)
+    if (-not $UserId) { return $true }
+    $name = $UserId
+    if ($name.Contains('\')) { $name = $name.Substring($name.LastIndexOf('\') + 1) }
+    if ($name.Contains('@')) { $name = $name.Substring(0, $name.IndexOf('@')) }
+    return ($name -ieq $env:USERNAME)
+}
+
 function Test-TfRelayTaskRegistered {
     # Costs one module import (about half a second) on the real path; the seams answer instantly.
+    # A task registered for another user does not count: it would run tf with that user's credentials.
     switch ($env:CLAUDE_TFVC_RELAY_LAUNCH) {
         'child' { return $true }
         'noop'  { return $true }
         'none'  { return $false }
     }
-    try { $null = Get-ScheduledTask -TaskName $TfvcRelayTask -ErrorAction Stop; return $true } catch { return $false }
+    try {
+        $task = Get-ScheduledTask -TaskName $TfvcRelayTask -ErrorAction Stop
+        return (Test-TfRelayPrincipalMatches "$($task.Principal.UserId)")
+    } catch { return $false }
 }
 
 function ConvertTo-TfRelayFailureText {
@@ -104,6 +120,8 @@ function Resolve-TfTransport {
     # TFVC_TRANSPORT = auto (default) | direct | relay, from the project settings then the environment, same
     # order as TF_EXE. In auto, relay needs a remote session AND an available relay (live worker or registered task).
     param([string]$ProjectDir)
+    if (-not $ProjectDir) { $ProjectDir = $env:CLAUDE_PROJECT_DIR }
+    if (-not $ProjectDir) { $ProjectDir = (Get-Location).ProviderPath }
     $setting = 'auto'; $source = 'default'
     $cfg = Get-ProjectEnvSetting -ProjectDir $ProjectDir -Name 'TFVC_TRANSPORT' -Detailed
     if ($cfg) { $setting = $cfg.Value; $source = $cfg.Source }
@@ -189,18 +207,31 @@ function Invoke-TfDirect {
     return New-TfResult -ExitCode $p.ExitCode -StdErr $ansi.GetString($kept.ToArray()) -Transport 'direct'
 }
 
+function Read-TfWorkerVersion {
+    # worker.version as { Version; Sha256 } ('' when absent or unreadable). Another client may be writing it at
+    # this instant (a sharing violation), so a failed read is retried briefly.
+    param($Paths)
+    $text = ''
+    for ($i = 0; $i -lt 10; $i++) {
+        if (-not (Test-Path -LiteralPath $Paths.Version -PathType Leaf)) { break }
+        try { $text = [System.IO.File]::ReadAllText($Paths.Version); break } catch { Start-Sleep -Milliseconds 50 }
+    }
+    [pscustomobject]@{
+        Version = [regex]::Match($text, '(?m)^version=(.+)$').Groups[1].Value.Trim()
+        Sha256  = [regex]::Match($text, '(?m)^sha256=(\w+)').Groups[1].Value
+    }
+}
+
 function Install-TfRelayWorker {
-    # Installs or refreshes the single-file worker copy the scheduled task runs. SHA-256 of the plugin's copy
-    # versus worker.version decides (not the version number, so development iterations refresh too).
+    # Installs or refreshes the single-file worker copy the scheduled task runs. It is current only when the
+    # SHA-256 of the plugin's copy (development iterations refresh too) AND the plugin version (a version-only bump
+    # must still reach worker.version, which the worker reports) match worker.version, and the copy exists.
     param($Paths)
     New-Item -ItemType Directory -Path $Paths.Queue -Force | Out-Null
     $hash = (Get-FileHash -LiteralPath $Paths.Source -Algorithm SHA256 -ErrorAction Stop).Hash
-    $installed = ''
-    if (Test-Path -LiteralPath $Paths.Version -PathType Leaf) {
-        $m = [regex]::Match((Get-Content -LiteralPath $Paths.Version -Raw), '(?m)^sha256=(\w+)')
-        if ($m.Success) { $installed = $m.Groups[1].Value }
-    }
-    if ($installed -eq $hash -and (Test-Path -LiteralPath $Paths.Worker -PathType Leaf)) { return $false }
+    $version = Get-TfPluginVersion
+    $installed = Read-TfWorkerVersion -Paths $Paths
+    if ($installed.Sha256 -eq $hash -and $installed.Version -eq $version -and (Test-Path -LiteralPath $Paths.Worker -PathType Leaf)) { return $false }
     $tmp = "$($Paths.Worker).$([guid]::NewGuid().ToString('n')).tmp"
     try {
         Copy-Item -LiteralPath $Paths.Source -Destination $tmp -ErrorAction Stop
@@ -208,14 +239,24 @@ function Install-TfRelayWorker {
         else { [System.IO.File]::Move($tmp, $Paths.Worker) }
     }
     catch {
-        # Another client may have installed the same file an instant ago: then this one has nothing to do.
+        # Another client may have installed the same file an instant ago: then only worker.version is left to do.
         Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
         $installedNow = ''
         if (Test-Path -LiteralPath $Paths.Worker -PathType Leaf) { $installedNow = (Get-FileHash -LiteralPath $Paths.Worker -Algorithm SHA256 -ErrorAction SilentlyContinue).Hash }
-        if ($installedNow -eq $hash) { return $false }
-        throw
+        if ($installedNow -ne $hash) { throw }
     }
-    Set-Content -LiteralPath $Paths.Version -Value @("version=$(Get-TfPluginVersion)", "sha256=$hash") -Encoding Ascii
+    # Concurrent clients write the same two lines; a sharing violation means another one is writing or reading
+    # it, so retry, and stop as soon as the file already says what this client would write.
+    $lines = "version=$version`r`nsha256=$hash`r`n"
+    for ($i = 0; $i -lt 20; $i++) {
+        try { [System.IO.File]::WriteAllText($Paths.Version, $lines, [System.Text.Encoding]::ASCII); break }
+        catch {
+            $now = Read-TfWorkerVersion -Paths $Paths
+            if ($now.Sha256 -eq $hash -and $now.Version -eq $version) { break }
+            if ($i -eq 19) { throw }
+            Start-Sleep -Milliseconds 50
+        }
+    }
     return $true
 }
 
@@ -251,8 +292,8 @@ function Get-TfRelayTaskInfo {
     try {
         $task = Get-ScheduledTask -TaskName $TfvcRelayTask -ErrorAction Stop
         $info = Get-ScheduledTaskInfo -TaskName $TfvcRelayTask -ErrorAction Stop
-        return [pscustomobject]@{ Registered = $true; State = "$($task.State)"; LastRunTime = $info.LastRunTime; LastTaskResult = [int64]$info.LastTaskResult }
-    } catch { return [pscustomobject]@{ Registered = $false; State = 'not registered'; LastRunTime = $null; LastTaskResult = [int64]0 } }
+        return [pscustomobject]@{ Registered = $true; State = "$($task.State)"; LastRunTime = $info.LastRunTime; LastTaskResult = [int64]$info.LastTaskResult; UserId = "$($task.Principal.UserId)" }
+    } catch { return [pscustomobject]@{ Registered = $false; State = 'not registered'; LastRunTime = $null; LastTaskResult = [int64]0; UserId = '' } }
 }
 
 function Format-TfTaskState {
@@ -262,6 +303,7 @@ function Format-TfTaskState {
     $text = "task state $($Info.State), last result 0x$('{0:X8}' -f $Info.LastTaskResult)"
     $why = ConvertTo-TfRelayFailureText $Info.LastTaskResult
     if ($why) { $text += " ($why)" }
+    if (-not (Test-TfRelayPrincipalMatches $Info.UserId)) { $text += " (registered for user '$($Info.UserId)', not you; re-run Register-TfRelay.ps1)" }
     return $text
 }
 
@@ -296,7 +338,7 @@ function Invoke-TfRelay {
 
     $watch = [System.Diagnostics.Stopwatch]::StartNew()
     $lastKick = $null; $firstKick = $null
-    $claimed = $false; $goneSince = $null
+    $claimed = $false; $goneSince = $null; $deadSince = $null
     while ($true) {
         if (Test-Path -LiteralPath $resPath) {
             $res = Read-TfRelayJson $resPath
@@ -306,7 +348,7 @@ function Invoke-TfRelay {
                 return New-TfResult -ExitCode ([int]$res.exitCode) -StdOut "$($res.stdout)" -StdErr "$($res.stderr)" -Transport 'relay'
             }
             Remove-Item -LiteralPath $resPath -Force -ErrorAction SilentlyContinue
-            return New-TfResult -ExitCode 120 -Transport 'relay' -Diagnostic 'claude-tfvc: the relay response could not be read (unreadable JSON); see worker.log in the relay folder'
+            return New-TfResult -ExitCode 120 -Transport 'relay' -Diagnostic 'claude-tfvc: the relay response could not be read (unreadable JSON); tf may already have run, check tf status before retrying; see worker.log in the relay folder'
         }
         if (-not $claimed) {
             if (-not (Test-Path -LiteralPath $reqPath)) { $claimed = $true; continue }
@@ -330,6 +372,10 @@ function Invoke-TfRelay {
             if ($watch.Elapsed.TotalSeconds -ge $PickupTimeoutSec) {
                 Remove-Item -LiteralPath $reqPath -Force -ErrorAction SilentlyContinue
                 if (-not (Test-Path -LiteralPath $runPath) -and -not (Test-Path -LiteralPath $resPath)) {
+                    # Unclaimed while a live worker holds another claimed request: it is busy, not broken (one at a time).
+                    if (@(Get-ChildItem -LiteralPath $paths.Queue -Filter '*.run.json' -File -ErrorAction SilentlyContinue).Count -gt 0 -and (Test-TfRelayWorkerAlive $paths)) {
+                        return New-TfResult -ExitCode 124 -Transport 'relay' -Diagnostic "claude-tfvc: relay timeout: the relay worker is busy with an earlier tf command (waited $PickupTimeoutSec s); retry in a moment"
+                    }
                     $workerNote = if (Test-TfRelayWorkerAlive $paths) { 'a worker is running but did not pick the request up (see worker.log in the relay folder)' } else { 'no worker started' }
                     return New-TfResult -ExitCode 124 -Transport 'relay' -Diagnostic "claude-tfvc: relay timeout: waited $PickupTimeoutSec s for pickup; $workerNote; $(Format-TfTaskState (Get-TfRelayTaskInfo))"
                 }
@@ -337,6 +383,14 @@ function Invoke-TfRelay {
             }
         }
         else {
+            # Claimed and still running, but no worker holds the lock for 2 s: it died (killed, logoff) mid-call.
+            if (Test-Path -LiteralPath $runPath) {
+                if (Test-TfRelayWorkerAlive $paths) { $deadSince = $null }
+                elseif ($null -eq $deadSince) { $deadSince = $watch.Elapsed }
+                elseif (($watch.Elapsed - $deadSince).TotalSeconds -ge 2) {
+                    return New-TfResult -ExitCode 124 -Transport 'relay' -Diagnostic 'claude-tfvc: the relay worker stopped while tf was running; check tf status before retrying'
+                }
+            } else { $deadSince = $null }
             if (-not (Test-Path -LiteralPath $runPath) -and -not (Test-Path -LiteralPath $resPath)) {
                 if ($null -eq $goneSince) { $goneSince = $watch.Elapsed }
                 elseif (($watch.Elapsed - $goneSince).TotalMilliseconds -ge 500) {

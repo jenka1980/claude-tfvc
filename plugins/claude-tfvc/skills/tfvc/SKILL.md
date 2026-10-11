@@ -32,6 +32,7 @@ own; 120 means the relay is not set up (run `/tf-relay`), 124 a relay timeout, 1
 18 = VS 18) for `/tf-select`; the resolution order is the project's `.claude/settings.local.json` (then
 `settings.json`) `env.TF_EXE`, the `TF_EXE` environment variable, PATH, vswhere, then the default Visual Studio
 folders, newest version first.
+
 ## The core model: read-only until checkout
 TFVC keeps unchanged files read-only, so a write fails (EPERM, "access denied") until the file is checked out.
 The plugin's PreToolUse hook runs `tf checkout` on a read-only file right before Edit/Write; `/tf-checkout` does

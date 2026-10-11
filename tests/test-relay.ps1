@@ -79,9 +79,13 @@ Set-Content -LiteralPath "$ProjLocalRelay\.claude\settings.local.json" -Value (@
 Set-Content -LiteralPath "$ProjLocalRelay\.claude\settings.json"       -Value (@{ env = @{ TFVC_TRANSPORT = 'direct' } } | ConvertTo-Json -Depth 5)
 Set-Content -LiteralPath "$ProjSharedDirect\.claude\settings.json"     -Value (@{ env = @{ TFVC_TRANSPORT = 'direct' } } | ConvertTo-Json -Depth 5)
 Set-Content -LiteralPath "$Proj\.claude\settings.local.json" -Value (@{ env = @{ TFVC_TRANSPORT = 'relay' } } | ConvertTo-Json -Depth 5)
-# Environment every relay case starts from (null = make sure the variable is absent).
+$ProjLocalDirect  = Join-Path $S 'proj-local-direct';  New-Item -ItemType Directory -Path "$ProjLocalDirect\.claude" -Force | Out-Null
+Set-Content -LiteralPath "$ProjLocalDirect\.claude\settings.local.json" -Value (@{ env = @{ TFVC_TRANSPORT = 'direct' } } | ConvertTo-Json -Depth 5)
+# Environment every relay case starts from (null = make sure the variable is absent). The fake tf.exe lives under
+# $S, which the worker trusts only through CLAUDE_TFVC_RELAY_TRUSTED_ROOTS (ALLOW_UNSIGNED skips the signature only).
 $RelayEnv = @{ TF_EXE = $FakeTf; CLAUDE_TFVC_RELAY_ROOT = $Relay; CLAUDE_TFVC_RELAY_LAUNCH = 'child'; CLAUDE_TFVC_RELAY_LINGER_SEC = '1'
-               CLAUDE_TFVC_RELAY_ALLOW_UNSIGNED = '1'; TFVC_TRANSPORT = $null; CLAUDE_PROJECT_DIR = $ProjNone; SSH_CONNECTION = $null; SSH_CLIENT = $null; TFVC_RELAY_TIMEOUT = $null }
+               CLAUDE_TFVC_RELAY_ALLOW_UNSIGNED = '1'; CLAUDE_TFVC_RELAY_TRUSTED_ROOTS = $S
+               TFVC_TRANSPORT = $null; CLAUDE_PROJECT_DIR = $ProjNone; SSH_CONNECTION = $null; SSH_CLIENT = $null; TFVC_RELAY_TIMEOUT = $null }
 $DirectEnv = @{ TF_EXE = $FakeTf; CLAUDE_TFVC_RELAY_ROOT = $Relay; CLAUDE_TFVC_RELAY_LAUNCH = 'none'; TFVC_TRANSPORT = $null; CLAUDE_PROJECT_DIR = $ProjNone; SSH_CONNECTION = $null; SSH_CLIENT = $null }
 
 function Set-TestEnv([hashtable]$EnvVars) {
@@ -181,6 +185,9 @@ try {
         $r = Invoke-InChild $exe @{} ". '$InvokeTf'; (ConvertTo-TfRelayFailureText 267011) -match 'RDP'; (ConvertTo-TfRelayFailureText 2147943726) -match 'ogon'; (ConvertTo-TfRelayFailureText -2147023570) -match 'ogon'; (ConvertTo-TfRelayFailureText 0x800710E0) -match 'refused'; `$null -eq (ConvertTo-TfRelayFailureText 0)"
         Check "$exe R9i LastTaskResult codes decode whether given as UInt32 values or as Int32 hex literals" ((($r.Out -replace '\s', '') -eq 'TrueTrueTrueTrueTrue')) "out=[$($r.Out)]"
     }
+    # R9j: the task counts as registered only when it runs as the current user (any DOMAIN\ or @domain part ignored).
+    $r = Invoke-InChild 'powershell' @{} ". '$InvokeTf'; Test-TfRelayPrincipalMatches `"`$env:USERDOMAIN\`$env:USERNAME`"; Test-TfRelayPrincipalMatches (`$env:USERNAME.ToUpper()); Test-TfRelayPrincipalMatches `"`$env:USERNAME@corp.example`"; Test-TfRelayPrincipalMatches ''; Test-TfRelayPrincipalMatches 'someone-else'"
+    Check 'R9j Test-TfRelayPrincipalMatches: DOMAIN\user, USER (any case), user@domain and empty match; someone-else does not' ((($r.Out -replace '\s', '') -eq 'TrueTrueTrueTrueFalse')) "out=[$($r.Out)]"
 
     # ---- R13 command-line quoting (CommandLineToArgvW round trip through the fake's Main) --------------
     $HardArgs = @('plain', 'with space', 'quote"inside', 'trail\', 'trail\\', 'back\slash', '"', '', 'a b"c\', "tab`there",
@@ -266,7 +273,7 @@ try {
         $runPath = Join-Path $Queue "$id.run.json"
         if ($RawText) { [System.IO.File]::WriteAllText($runPath, $RawText, $Utf8) }
         else { [System.IO.File]::WriteAllText($runPath, ($Request | ConvertTo-Json -Depth 4 -Compress), $Utf8) }
-        $envVars = Merge-Env @{ CLAUDE_TFVC_RELAY_ROOT = $Relay; CLAUDE_TFVC_RELAY_ALLOW_UNSIGNED = '1' } $(if ($ExtraEnv) { $ExtraEnv } else { @{} })
+        $envVars = Merge-Env @{ CLAUDE_TFVC_RELAY_ROOT = $Relay; CLAUDE_TFVC_RELAY_ALLOW_UNSIGNED = '1'; CLAUDE_TFVC_RELAY_TRUSTED_ROOTS = $S } $(if ($ExtraEnv) { $ExtraEnv } else { @{} })
         $r = Invoke-InChild 'powershell' $envVars ". '$Worker'; Invoke-RelayRequest -RunPath '$runPath'"
         $resPath = Join-Path $Queue "$id.res.json"
         $res = if (Test-Path -LiteralPath $resPath) { Get-Content -LiteralPath $resPath -Raw -Encoding UTF8 | ConvertFrom-Json } else { $null }
@@ -306,11 +313,25 @@ try {
             New-Item -ItemType Directory -Path $Queue -Force | Out-Null
             [System.IO.File]::WriteAllText((Join-Path $Queue "$($first.id).run.json"), ($first | ConvertTo-Json -Depth 4 -Compress), $Utf8)
             [System.IO.File]::WriteAllText((Join-Path $Queue "$($second.id).run.json"), ($second | ConvertTo-Json -Depth 4 -Compress), $Utf8)
-            $r = Invoke-InChild 'powershell' @{ CLAUDE_TFVC_RELAY_ROOT = $Relay; CLAUDE_TFVC_RELAY_ALLOW_UNSIGNED = $null } $cmd
+            $r = Invoke-InChild 'powershell' @{ CLAUDE_TFVC_RELAY_ROOT = $Relay; CLAUDE_TFVC_RELAY_ALLOW_UNSIGNED = $null; CLAUDE_TFVC_RELAY_TRUSTED_ROOTS = $S } $cmd
             $resA = Get-Content -LiteralPath (Join-Path $Queue "$($first.id).res.json") -Raw | ConvertFrom-Json
             $resB = Get-Content -LiteralPath (Join-Path $Queue "$($second.id).res.json") -Raw | ConvertFrom-Json
             Check 'R12e a signed tf.exe passes, then the same path swapped for an unsigned file is refused within one worker life' (($null -eq $resA.error) -and ("$($resB.error)" -match 'not a Microsoft-signed')) "A.error=[$($resA.error)] B.error=[$($resB.error)]"
-        } else { Skip 'R12e signature re-check after a file swap' 'no Microsoft-signed tf.exe found on this machine' }
+
+            # R12f: a genuine signed tf.exe outside Program Files / Visual Studio runs only when the worker's own
+            # environment lists its folder in CLAUDE_TFVC_RELAY_TRUSTED_ROOTS.
+            $outsideDir = Join-Path $S 'outside'; New-Item -ItemType Directory -Path $outsideDir -Force | Out-Null
+            $outsideTf = Join-Path $outsideDir 'tf.exe'
+            Copy-Item -LiteralPath $realTf -Destination $outsideTf -Force
+            $w = Invoke-WorkerRequest (New-Request @('help') @{ tf = $outsideTf }) @{ CLAUDE_TFVC_RELAY_ALLOW_UNSIGNED = $null; CLAUDE_TFVC_RELAY_TRUSTED_ROOTS = $null }
+            Check 'R12f a signed tf.exe outside the trusted locations is refused ("must live under")' ("$($w.Res.error)" -match 'must live under') "error=[$($w.Res.error)]"
+            $w = Invoke-WorkerRequest (New-Request @('help') @{ tf = $outsideTf }) @{ CLAUDE_TFVC_RELAY_ALLOW_UNSIGNED = $null; CLAUDE_TFVC_RELAY_TRUSTED_ROOTS = $S }
+            Check 'R12f the same tf.exe passes the location rule when CLAUDE_TFVC_RELAY_TRUSTED_ROOTS lists its folder' (($null -ne $w.Res) -and ("$($w.Res.error)" -notmatch 'must live under')) "error=[$($w.Res.error)] res=$($null -ne $w.Res)"
+        } else {
+            Skip 'R12e signature re-check after a file swap' 'no Microsoft-signed tf.exe found on this machine'
+            Skip 'R12f a signed tf.exe outside the trusted locations is refused' 'no Microsoft-signed tf.exe found on this machine'
+            Skip 'R12f the same tf.exe passes with CLAUDE_TFVC_RELAY_TRUSTED_ROOTS' 'no Microsoft-signed tf.exe found on this machine'
+        }
 
         $w = Invoke-WorkerRequest (New-Request @('status', '/ansi'))
         Check 'R4 ANSI (Hebrew/Cyrillic) stdout is decoded to Unicode in the response' ("$($w.Res.stdout)".StartsWith($SampleRT)) "stdout=[$("$($w.Res.stdout)".Trim())] want=[$SampleRT]"
@@ -324,6 +345,10 @@ try {
         $w = Invoke-WorkerRequest (New-Request @('checkin', '/comment:secret-comment', 'D:\secret\path.cs'))
         $line = @($w.Log -split "`r?`n" | Where-Object { $_ -match $w.Res.id }) | Select-Object -Last 1
         Check 'R21 log line: utc id verb exit duration; no comment, no path' (($line -match '^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z [0-9a-f]{32} checkin exit=0 \d+ms$') -and ($w.Log -notmatch 'secret')) "line=[$line]"
+
+        $w = Invoke-WorkerRequest (New-Request @('D:\x\path.cs', 'status'))
+        $line = @($w.Log -split "`r?`n" | Where-Object { $_ -match $w.Res.id }) | Select-Object -Last 1
+        Check 'R21b a first argument that is not a plain word is logged as "?" (the log never holds a path)' (($line -match '^\S+ [0-9a-f]{32} \? exit=\d+ \d+ms$') -and ($w.Log -notmatch 'path\.cs')) "line=[$line]"
 
         $w = Invoke-WorkerRequest (New-Request @('get', '/big'))
         Check 'R32c worker reads 300 KB on each stream concurrently (no deadlock)' (($w.Res.stdout.Length -eq 303000) -and ($w.Res.stderr.Length -eq 303000)) "out=$($w.Res.stdout.Length) err=$($w.Res.stderr.Length)"
@@ -342,7 +367,7 @@ try {
 
     # ---- worker: the loop (run as a real child process, powershell.exe) ---------------------------------
     function Start-WorkerChild([hashtable]$ExtraEnv) {
-        $envVars = Merge-Env @{ CLAUDE_TFVC_RELAY_ROOT = $Relay; CLAUDE_TFVC_RELAY_ALLOW_UNSIGNED = '1'; CLAUDE_TFVC_RELAY_LINGER_SEC = '1' } $(if ($ExtraEnv) { $ExtraEnv } else { @{} })
+        $envVars = Merge-Env @{ CLAUDE_TFVC_RELAY_ROOT = $Relay; CLAUDE_TFVC_RELAY_ALLOW_UNSIGNED = '1'; CLAUDE_TFVC_RELAY_TRUSTED_ROOTS = $S; CLAUDE_TFVC_RELAY_LINGER_SEC = '1' } $(if ($ExtraEnv) { $ExtraEnv } else { @{} })
         $saved = Set-TestEnv $envVars
         try { return (Start-Process -FilePath $Exes.powershell -ArgumentList "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$Worker`"" -WindowStyle Hidden -PassThru) }
         finally { Restore-TestEnv $saved }
@@ -456,6 +481,38 @@ try {
         $proc = Start-WorkerChild; $null = $proc.WaitForExit(15000)
         Check 'R7 pickup timeout: exit 124 with the wait and task state, request deleted, never run later' (($r.Out -match '^124\|') -and ($r.Out -match 'relay timeout') -and ($left -eq 0) -and (@(Get-FakeCalls).Count -eq 0)) "out=[$($r.Out)] left=$left calls=$(@(Get-FakeCalls).Count)"
 
+        # R7b: the worker is busy with a long tf call; a second client whose pickup times out says so.
+        Wait-NoWorker; Reset-Relay; Reset-FakeLog
+        $busyScript = Join-Path $S 'busy-client.ps1'
+        Set-Content -LiteralPath $busyScript -Encoding Ascii -Value @(". '$InvokeTf'", "`$x = Invoke-Tf -Arguments @('status', '/sleep:6') -PickupTimeoutSec 15 -TimeoutSec 60 -Capture", 'Write-Output $x.ExitCode')
+        $saved = Set-TestEnv $RelayOn
+        try { $bp = Start-Process -FilePath $Exes.powershell -ArgumentList "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$busyScript`"" -RedirectStandardOutput (Join-Path $S 'busy.out') -NoNewWindow -PassThru } finally { Restore-TestEnv $saved }
+        $sw = [System.Diagnostics.Stopwatch]::StartNew(); $runFile = $null
+        while ($sw.Elapsed.TotalSeconds -lt 15 -and -not $runFile) { $runFile = Get-ChildItem -LiteralPath $Queue -Filter '*.run.json' -ErrorAction SilentlyContinue | Select-Object -First 1; Start-Sleep -Milliseconds 100 }
+        $r = Invoke-InChild 'powershell' $RelayOn ". '$InvokeTf'; `$x = Invoke-Tf -Arguments @('status','/stdout:second') -PickupTimeoutSec 2 -TimeoutSec 10 -Capture; `"`$(`$x.ExitCode)|`$(`$x.Diagnostic)`""
+        $null = $bp.WaitForExit(30000)
+        if (-not $bp.HasExited) { Stop-Process -Id $bp.Id -Force -ErrorAction SilentlyContinue }
+        Check 'R7b pickup timeout while the worker runs an earlier tf command -> 124 "busy with an earlier tf command"' (($null -ne $runFile) -and ($r.Out -match '^124\|') -and ($r.Out -match 'busy with an earlier tf command')) "runSeen=$($null -ne $runFile) out=[$($r.Out)]"
+        Wait-NoWorker
+
+        # R10c: a claimed request whose .run.json stays while no worker is alive -> 124 "worker stopped" within seconds.
+        Reset-Relay
+        $deadScript = Join-Path $S 'dead-client.ps1'
+        Set-Content -LiteralPath $deadScript -Encoding Ascii -Value @(". '$InvokeTf'", "`$x = Invoke-Tf -Arguments @('status') -PickupTimeoutSec 8 -TimeoutSec 60 -Capture", 'Write-Output $x.ExitCode', 'Write-Output $x.Diagnostic')
+        $deadOut = Join-Path $S 'dead.out'
+        $saved = Set-TestEnv (Merge-Env $RelayOn @{ CLAUDE_TFVC_RELAY_LAUNCH = 'noop' })
+        try { $dp = Start-Process -FilePath $Exes.powershell -ArgumentList "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$deadScript`"" -RedirectStandardOutput $deadOut -NoNewWindow -PassThru } finally { Restore-TestEnv $saved }
+        $sw = [System.Diagnostics.Stopwatch]::StartNew(); $reqFile = $null
+        while ($sw.Elapsed.TotalSeconds -lt 6 -and -not $reqFile) { $reqFile = Get-ChildItem -LiteralPath $Queue -Filter '*.req.json' -ErrorAction SilentlyContinue | Select-Object -First 1; Start-Sleep -Milliseconds 100 }
+        $claimedAt = $null
+        if ($reqFile) { $runFile = $reqFile.FullName -replace '\.req\.json$', '.run.json'; Move-Item -LiteralPath $reqFile.FullName -Destination $runFile; $claimedAt = $sw.Elapsed }
+        $null = $dp.WaitForExit(20000)
+        $afterClaim = if ($claimedAt) { ($sw.Elapsed - $claimedAt).TotalSeconds } else { -1 }
+        if (-not $dp.HasExited) { Stop-Process -Id $dp.Id -Force -ErrorAction SilentlyContinue }
+        if ($reqFile) { Remove-Item -LiteralPath $runFile -Force -ErrorAction SilentlyContinue }
+        $lines = @(Get-Content -LiteralPath $deadOut)
+        Check 'R10c a claimed request whose .run.json stays while no worker is alive -> 124 "worker stopped" within seconds' (($lines[0] -eq '124') -and ($lines[1] -match 'worker stopped') -and ($afterClaim -ge 0) -and ($afterClaim -lt 6)) "lines=[$($lines -join ' / ')] secsAfterClaim=$([math]::Round($afterClaim, 1))"
+
         # R25: the worker drops a claimed request (expired on claim / crashed) -> 124 quickly, not after TimeoutSec
         Wait-NoWorker; Reset-Relay
         $dropScript = Join-Path $S 'drop-client.ps1'
@@ -512,6 +569,17 @@ try {
         }
         $verOk = (Get-Content -LiteralPath (Join-Path $Relay 'worker.version') -Raw) -match "sha256=$((Get-FileHash -LiteralPath $Worker -Algorithm SHA256).Hash)"
         Check 'R16c ten concurrent worker installs from an empty relay folder all succeed and leave a consistent worker.version' (($instBad.Count -eq 0) -and $verOk) (($instBad -join ' ; ') + " verOk=$verOk")
+
+        # R16d: a version-only bump (same worker file, older version= line) still rewrites worker.version.
+        Wait-NoWorker; Reset-Relay
+        New-Item -ItemType Directory -Path $Queue -Force | Out-Null
+        Copy-Item -LiteralPath $Worker -Destination (Join-Path $Relay 'Tf-RelayWorker.ps1') -Force
+        Set-Content -LiteralPath (Join-Path $Relay 'worker.version') -Value @('version=0.0.0', "sha256=$((Get-FileHash -LiteralPath $Worker -Algorithm SHA256).Hash)") -Encoding Ascii
+        $r = Invoke-Launcher 'powershell' $RelayOn @('status', '/stdout:bumped')
+        $pluginVer = (Get-Content -LiteralPath (Join-Path $Plugin '.claude-plugin\plugin.json') -Raw | ConvertFrom-Json).version
+        $verText = Get-Content -LiteralPath (Join-Path $Relay 'worker.version') -Raw
+        Check 'R16d same worker hash but an older version= line -> worker.version is rewritten with the plugin version' (($r.Exit -eq 0) -and ($verText -match "(?m)^version=$([regex]::Escape($pluginVer))\s*$")) "exit=$($r.Exit) ver=[$($verText.Trim())] plugin=$pluginVer"
+        Wait-NoWorker
 
         # R26: relay forced, task missing -> 120 with the registration command
         $r = Invoke-Launcher 'powershell' (Merge-Env $RelayOn @{ CLAUDE_TFVC_RELAY_LAUNCH = 'none' }) @('status')
@@ -627,6 +695,13 @@ try {
             $r = Invoke-InChild 'powershell' $DirectEnv ". '$InvokeTf'; `$x = Invoke-Tf -Arguments @('status','/stderr:TF30063: You are not authorized') -Capture; `"`$(`$x.ExitCode)|`$(`$x.Diagnostic)`""
             Check 'R15d capture mode (hook path): the TF30063 hint lands in Diagnostic, not on stderr' (($r.Out -match '^0\|') -and ($r.Out -match 'Run /tf-relay')) "out=[$($r.Out)]"
         }
+
+        # R27f: read-only files but no tf.exe anywhere -> not a TFVC project: the hook stays silent (as in 0.3.0).
+        # The ProgramFiles overrides are set in this process and inherited by the hook child (an explicit value is kept).
+        New-TestFile $RoFile $true
+        $noTfEnv = Merge-Env $DirectEnv @{ TF_EXE = $null; PATH = $MinPath; ProgramFiles = $PfEmpty; 'ProgramFiles(x86)' = $PfEmpty; ProgramW6432 = $PfEmpty; CLAUDE_PROJECT_DIR = $ProjNone }
+        $r = Invoke-HookCase 'powershell' $noTfEnv $RoFile
+        Check 'R27f hook, read-only file but no tf.exe anywhere: exit 0, empty stdout, nothing run' (($r.Exit -eq 0) -and ($r.Out -eq '') -and ($r.Calls.Count -eq 0)) "exit=$($r.Exit) out=[$($r.Out)] calls=$($r.Calls.Count)"
     } else { Skip 'R10/R11/R27 hook in relay mode' 'no fake tf.exe' }
 
     # ---- Register-TfRelay.ps1: -Status under the seams, the task spec, decoded failure codes ---------------
@@ -644,6 +719,10 @@ try {
         $calls = @(Get-FakeCalls)
         Check 'R17c -Status probes tf workspaces /noprompt through the relay and reports the time' (($r.Exit -eq 0) -and ($r.Out -match 'Probe:\s+tf workspaces /noprompt via relay: exit 0 in [\d.]+ s') -and ($calls.Count -eq 1) -and ($calls[0][0] -eq 'workspaces')) "exit=$($r.Exit) out=[$($r.Out)] calls=$($calls.Count)"
         Wait-NoWorker
+
+        # R17d: without CLAUDE_PROJECT_DIR the report reads the settings of the current directory, like Invoke-Tf.
+        $r = Invoke-InChild 'powershell' (Merge-Env $StatusEnv @{ CLAUDE_PROJECT_DIR = $null }) "Set-Location -LiteralPath '$ProjLocalDirect'; & '$Register' -Status -NoProbe; exit `$LASTEXITCODE"
+        Check 'R17d -Status without CLAUDE_PROJECT_DIR uses the current directory''s project settings' ($r.Out -match [regex]::Escape('Transport:  direct  (TFVC_TRANSPORT=direct from settings.local.json)')) "out=[$($r.Out)]"
     } else { Skip 'R17 Register-TfRelay.ps1 -Status' 'no fake tf.exe' }
 
     $r = Invoke-InChild 'powershell' @{} ". '$Register'; `$s = Get-TfRelayTaskSpec -WorkerPath 'C:\x\w.ps1'; `"`$(`$s.TaskName)|`$(`$s.Execute)|`$(`$s.Argument)|`$(`$s.LogonType)|`$(`$s.RunLevel)|`$(`$s.MultipleInstances)|`$(`$s.ExecutionTimeLimit.TotalHours)|`$(@(`$s.Triggers).Count)|`$(`$s.WorkingDirectory)|`$(`$s.AllowStartIfOnBatteries)|`$(`$s.DontStopIfGoingOnBatteries)`""
