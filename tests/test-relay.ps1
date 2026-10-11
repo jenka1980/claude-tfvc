@@ -184,7 +184,8 @@ try {
 
     # ---- R13 command-line quoting (CommandLineToArgvW round trip through the fake's Main) --------------
     $HardArgs = @('plain', 'with space', 'quote"inside', 'trail\', 'trail\\', 'back\slash', '"', '', 'a b"c\', "tab`there",
-                  $Sample, '%TEMP%', '&|^<>', '/comment:He said "hi" & left', 'D:\Projects\X\')
+                  $Sample, '%TEMP%', '&|^<>', '/comment:He said "hi" & left', 'D:\Projects\X\',
+                  'a\"b', 'x y\\"z', 'a\b c')
     $HardJson = Join-Path $S 'hard-args.json'
     [System.IO.File]::WriteAllText($HardJson, (ConvertTo-Json -InputObject $HardArgs -Compress), $Utf8)
     function Compare-Args([string[]]$Expected, $Got) {
@@ -247,6 +248,76 @@ try {
             Check "$exe R14 no tf.exe anywhere -> exit 127 and a one-line explanation" (($r.Exit -eq 127) -and ($r.Out -match 'no tf.exe found')) "exit=$($r.Exit) out=[$($r.Out)]"
         }
     } else { Skip 'R1/R3/R14/R15/R32 direct mode' 'no fake tf.exe' }
+
+    # ---- worker: one request at a time (Invoke-RelayRequest, powershell.exe only) ----------------------
+    $Queue = Join-Path $Relay 'queue'
+    function New-Request([string[]]$TfArgs, [hashtable]$Overrides) {
+        $id = [guid]::NewGuid().ToString('n')
+        $now = [DateTime]::UtcNow
+        $req = [ordered]@{ protocol = 1; id = $id; tf = $FakeTf; args = $TfArgs; cwd = $S; createdUtc = $now.ToString('o'); expiresUtc = $now.AddSeconds(30).ToString('o') }
+        if ($Overrides) { foreach ($k in $Overrides.Keys) { $req[$k] = $Overrides[$k] } }
+        return $req
+    }
+    function Invoke-WorkerRequest($Request, [hashtable]$ExtraEnv, [string]$RawText) {
+        # Drops <id>.run.json into the queue and runs Invoke-RelayRequest on it in a child Windows PowerShell.
+        Reset-FakeLog
+        New-Item -ItemType Directory -Path $Queue -Force | Out-Null
+        $id = $Request.id
+        $runPath = Join-Path $Queue "$id.run.json"
+        if ($RawText) { [System.IO.File]::WriteAllText($runPath, $RawText, $Utf8) }
+        else { [System.IO.File]::WriteAllText($runPath, ($Request | ConvertTo-Json -Depth 4 -Compress), $Utf8) }
+        $envVars = Merge-Env @{ CLAUDE_TFVC_RELAY_ROOT = $Relay; CLAUDE_TFVC_RELAY_ALLOW_UNSIGNED = '1' } $(if ($ExtraEnv) { $ExtraEnv } else { @{} })
+        $r = Invoke-InChild 'powershell' $envVars ". '$Worker'; Invoke-RelayRequest -RunPath '$runPath'"
+        $resPath = Join-Path $Queue "$id.res.json"
+        $res = if (Test-Path -LiteralPath $resPath) { Get-Content -LiteralPath $resPath -Raw -Encoding UTF8 | ConvertFrom-Json } else { $null }
+        $log = if (Test-Path -LiteralPath (Join-Path $Relay 'worker.log')) { Get-Content -LiteralPath (Join-Path $Relay 'worker.log') -Raw } else { '' }
+        return @{ Res = $res; RunLeft = (Test-Path -LiteralPath $runPath); Calls = @(Get-FakeCalls); Log = $log; Out = $r.Out }
+    }
+    if ($HaveFake) {
+        Reset-Relay
+        $w = Invoke-WorkerRequest (New-Request @('status', 'x.cs'))
+        Check 'R8a /noprompt is appended when absent' (($w.Calls.Count -eq 1) -and ($w.Calls[0][-1] -eq '/noprompt') -and (@($w.Calls[0] | Where-Object { $_ -match '^[/-]noprompt$' }).Count -eq 1)) "args=[$($w.Calls[0] -join '|')]"
+        $w = Invoke-WorkerRequest (New-Request @('status', '/noprompt', 'x.cs'))
+        Check 'R8b /noprompt present -> not duplicated' (($w.Calls.Count -eq 1) -and (@($w.Calls[0] | Where-Object { $_ -match '^[/-]noprompt$' }).Count -eq 1)) "args=[$($w.Calls[0] -join '|')]"
+        $w = Invoke-WorkerRequest (New-Request @('status', '-noprompt'))
+        Check 'R8c -noprompt counts as present' (($w.Calls.Count -eq 1) -and ($w.Calls[0] -notcontains '/noprompt')) "args=[$($w.Calls[0] -join '|')]"
+
+        $w = Invoke-WorkerRequest (New-Request @('checkin', '/comment:secret') @{ expiresUtc = [DateTime]::UtcNow.AddSeconds(-5).ToString('o') })
+        Check 'R6 expired request: not run, deleted, logged, no response' (($w.Calls.Count -eq 0) -and (-not $w.RunLeft) -and ($null -eq $w.Res) -and ($w.Log -match 'expired')) "calls=$($w.Calls.Count) runLeft=$($w.RunLeft) res=$($null -ne $w.Res)"
+
+        $w = Invoke-WorkerRequest (New-Request @('status')) @{ CLAUDE_TFVC_RELAY_ALLOW_UNSIGNED = $null }
+        Check 'R12a unsigned tf.exe refused without the bypass (error in the response, tf not run)' (($w.Calls.Count -eq 0) -and ($w.Res.error -match 'not a Microsoft-signed')) "error=[$($w.Res.error)] calls=$($w.Calls.Count)"
+        $NotTf = Join-Path $FakeDir 'notf.exe'; Copy-Item -LiteralPath $FakeTf -Destination $NotTf -Force
+        $w = Invoke-WorkerRequest (New-Request @('status') @{ tf = $NotTf })
+        Check 'R12b an executable not named tf.exe is refused even with the bypass' (($w.Calls.Count -eq 0) -and ($w.Res.error -match 'must be named tf.exe')) "error=[$($w.Res.error)]"
+
+        $w = Invoke-WorkerRequest (New-Request @('status', '/ansi'))
+        Check 'R4 ANSI (Hebrew/Cyrillic) stdout is decoded to Unicode in the response' ($w.Res.stdout.StartsWith($SampleRT)) "stdout=[$($w.Res.stdout.Trim())] want=[$SampleRT]"
+
+        $w = Invoke-WorkerRequest (New-Request @('status') @{ protocol = 2 })
+        Check 'R20 unknown protocol -> error naming both versions, tf not run' (($w.Calls.Count -eq 0) -and ($w.Res.error -match 'protocol 2 is not supported') -and ($w.Res.error -match 'protocol 1')) "error=[$($w.Res.error)]"
+
+        $w = Invoke-WorkerRequest (New-Request @('status', '/exit:100', '/stderr:boom'))
+        Check 'R34 exit code and stderr pass through the response' (($w.Res.exitCode -eq 100) -and ($w.Res.stderr -match 'boom') -and (-not $w.RunLeft)) "exit=$($w.Res.exitCode) stderr=[$($w.Res.stderr.Trim())]"
+
+        $w = Invoke-WorkerRequest (New-Request @('checkin', '/comment:secret-comment', 'D:\secret\path.cs'))
+        $line = @($w.Log -split "`r?`n" | Where-Object { $_ -match $w.Res.id }) | Select-Object -Last 1
+        Check 'R21 log line: utc id verb exit duration; no comment, no path' (($line -match '^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z [0-9a-f]{32} checkin exit=0 \d+ms$') -and ($w.Log -notmatch 'secret')) "line=[$line]"
+
+        $w = Invoke-WorkerRequest (New-Request @('get', '/big'))
+        Check 'R32c worker reads 300 KB on each stream concurrently (no deadlock)' (($w.Res.stdout.Length -eq 303000) -and ($w.Res.stderr.Length -eq 303000)) "out=$($w.Res.stdout.Length) err=$($w.Res.stderr.Length)"
+
+        $w = Invoke-WorkerRequest (New-Request @('status')) @{} '{ this is not json'
+        Check 'R35 malformed request file: deleted, logged, no response, tf not run' ((-not $w.RunLeft) -and ($null -eq $w.Res) -and ($w.Log -match 'malformed') -and ($w.Calls.Count -eq 0)) "runLeft=$($w.RunLeft) log=[$($w.Log)]"
+    } else { Skip 'R4/R6/R8/R12/R20/R21/R32c/R34/R35 worker request processing' 'no fake tf.exe' }
+
+    # ---- static: the quoting function is one implementation in two files -------------------------------
+    function Get-FunctionText([string]$File, [string]$Name) {
+        $m = [regex]::Match((Get-Content -LiteralPath $File -Raw), "(?s)\r?\nfunction $Name \{.*?\r?\n\}")
+        if ($m.Success) { return ($m.Value -replace '\r', '') } else { return "<missing in $File>" }
+    }
+    Check 'R36 ConvertTo-CommandLine in Invoke-Tf.ps1 and Tf-RelayWorker.ps1 are identical' `
+        ((Get-FunctionText $InvokeTf 'ConvertTo-CommandLine') -eq (Get-FunctionText $Worker 'ConvertTo-CommandLine')) 'copies differ (or one is missing)'
 
     # ---- report (keep this anchor last; later tasks insert their checks above it) --------------------
 }
