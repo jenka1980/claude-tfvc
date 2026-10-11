@@ -534,10 +534,11 @@ try {
         Reset-FakeLog
         $payload = @{ tool_input = @{ file_path = $Path }; cwd = $Proj } | ConvertTo-Json -Compress
         $saved = Set-TestEnv $EnvVars
-        $savedOe = $global:OutputEncoding
+        $savedOe = $global:OutputEncoding; $savedCe = [Console]::OutputEncoding
         $global:OutputEncoding = New-Object System.Text.UTF8Encoding $false   # Claude Code pipes the payload as UTF-8; 5.1 defaults to ASCII ('?')
+        [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false   # decode the hook's UTF-8 output whatever the console code page is
         try { $out = ($payload | & $Exes[$Exe] -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $Hook 2>&1 | Out-String).Trim(); $code = $LASTEXITCODE }
-        finally { $global:OutputEncoding = $savedOe; Restore-TestEnv $saved }
+        finally { $global:OutputEncoding = $savedOe; [Console]::OutputEncoding = $savedCe; Restore-TestEnv $saved }
         return @{ Exit = $code; Out = $out; Calls = @(Get-FakeCalls) }
     }
     $RoFile  = Join-Path $S 'ro.txt';                                 New-TestFile $RoFile $true
@@ -566,12 +567,7 @@ try {
             # The hook passes only 'checkout /noprompt <file>', so the fake cannot be told to fail; drive a failure
             # through the transport instead: forced relay with the unsigned bypass removed -> worker refusal -> 120.
             Reset-Relay; Wait-NoWorker
-            # A powershell.exe worker spawned by pwsh inherits PowerShell 7's module path and cannot load
-            # Get-AuthenticodeSignature (test seam only: the real task starts clean), so a 5.1 client starts the
-            # worker first (refused request, 5 s linger) and the hook under test then talks to that worker.
-            $refuseEnv = Merge-Env $HookEnv @{ CLAUDE_TFVC_RELAY_ALLOW_UNSIGNED = $null; CLAUDE_TFVC_RELAY_LINGER_SEC = '5' }
-            $null = Invoke-InChild 'powershell' $refuseEnv ". '$InvokeTf'; `$null = Invoke-Tf -Arguments @('status') -Capture"
-            $r = Invoke-HookCase $exe $refuseEnv $RoFile
+            $r = Invoke-HookCase $exe (Merge-Env $HookEnv @{ CLAUDE_TFVC_RELAY_ALLOW_UNSIGNED = $null }) $RoFile
             $json = $null; try { $json = $r.Out | ConvertFrom-Json } catch { }
             $ctx = if ($json) { "$($json.hookSpecificOutput.additionalContext)" } else { '' }
             Check "$exe R27b hook, worker refusal: exit 0 and additionalContext carries the transport, code 120 and the reason" `
@@ -581,6 +577,28 @@ try {
             $freshRoot = Join-Path $S "relay-r11-$exe"
             $r = Invoke-HookCase $exe (Merge-Env $HookEnv @{ CLAUDE_TFVC_RELAY_ROOT = $freshRoot }) $RwFile
             Check "$exe R11 hook, writable file: nothing runs, no relay folder appears" (($r.Exit -eq 0) -and ($r.Out -eq '') -and ($r.Calls.Count -eq 0) -and (-not (Test-Path -LiteralPath $freshRoot))) "exit=$($r.Exit) out=[$($r.Out)] folder=$(Test-Path -LiteralPath $freshRoot)"
+
+            $sidecar = "$FakeTf.stderr"
+            try {
+                Set-Content -LiteralPath $sidecar -Value 'TF30063: You are not authorized to access http://tfs:8080/tfs.' -Encoding Ascii
+                New-TestFile $RoFile $true
+                $r = Invoke-HookCase $exe (Merge-Env $DirectEnv @{ CLAUDE_PROJECT_DIR = $ProjNone }) $RoFile
+                $json = $null; try { $json = $r.Out | ConvertFrom-Json } catch { }
+                $ctx = if ($json) { "$($json.hookSpecificOutput.additionalContext)" } else { '' }
+                Check "$exe R27c hook, direct chosen by auto, tf says TF30063 -> context shows TF30063, exit 100 and the /tf-relay hint" (($r.Exit -eq 0) -and ($ctx -match 'direct, exit 100') -and ($ctx -match 'TF30063') -and ($ctx -match 'Run /tf-relay')) "exit=$($r.Exit) out=[$($r.Out)]"
+                New-TestFile $RoFile $true
+                $r = Invoke-HookCase $exe (Merge-Env $DirectEnv @{ CLAUDE_PROJECT_DIR = $ProjNone; TFVC_TRANSPORT = 'direct' }) $RoFile
+                $json = $null; try { $json = $r.Out | ConvertFrom-Json } catch { }
+                $ctx = if ($json) { "$($json.hookSpecificOutput.additionalContext)" } else { '' }
+                Check "$exe R27d hook, forced direct, TF30063 -> context shows the error but no /tf-relay hint" (($r.Exit -eq 0) -and ($ctx -match 'TF30063') -and ($ctx -notmatch '/tf-relay')) "exit=$($r.Exit) out=[$($r.Out)]"
+                Reset-Relay; Wait-NoWorker
+                New-TestFile $RoFile $true
+                $r = Invoke-HookCase $exe $HookEnv $RoFile
+                $json = $null; try { $json = $r.Out | ConvertFrom-Json } catch { }
+                $ctx = if ($json) { "$($json.hookSpecificOutput.additionalContext)" } else { '' }
+                Check "$exe R27e hook, relay, TF30063 from the worker -> context shows 'relay, exit 100' and TF30063, no /tf-relay hint" (($r.Exit -eq 0) -and ($ctx -match 'relay, exit 100') -and ($ctx -match 'TF30063') -and ($ctx -notmatch '/tf-relay')) "exit=$($r.Exit) out=[$($r.Out)]"
+                Wait-NoWorker
+            } finally { Remove-Item -LiteralPath $sidecar -Force -ErrorAction SilentlyContinue }
 
             $r = Invoke-InChild 'powershell' $DirectEnv ". '$InvokeTf'; `$x = Invoke-Tf -Arguments @('status','/stderr:TF30063: You are not authorized') -Capture; `"`$(`$x.ExitCode)|`$(`$x.Diagnostic)`""
             Check 'R15d capture mode (hook path): the TF30063 hint lands in Diagnostic, not on stderr' (($r.Out -match '^0\|') -and ($r.Out -match 'Run /tf-relay')) "out=[$($r.Out)]"

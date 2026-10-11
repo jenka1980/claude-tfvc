@@ -3,7 +3,7 @@
 # Design goals:
 #   * SAFE everywhere - in non-TFVC / git projects this is a near-instant no-op.
 #   * NEVER blocks an edit. We always exit 0 (allow). When checkout fails we let the edit proceed and hand
-#     Claude the reason as additionalContext (TF30063 -> run /tf-relay; task not started -> log in over RDP).
+#     Claude the reason as additionalContext (the launcher supplies the TF30063 -> /tf-relay hint where it applies).
 #   * Only acts when the target file is READ-ONLY, which is TFVC's "not checked out" signal. Normal (writable)
 #     files are skipped instantly.
 #   * Runs on Windows PowerShell 5.1 (built into every Windows) as well as PowerShell 7.
@@ -35,9 +35,6 @@ try {
             $why = ((@($r.Diagnostic, $r.StdErr, $r.StdOut) | Where-Object { "$_".Trim() }) -join ' ') -replace '\s+', ' '
             if ($why.Length -gt 600) { $why = $why.Substring(0, 600) + '...' }
             $msg = "claude-tfvc: tf checkout of $file failed ($($r.Transport), exit $($r.ExitCode)): $why"
-            if ($why -match 'TF30063' -and $why -notmatch '/tf-relay') {
-                $msg += ' This session has no network credentials; run /tf-relay to route tf through your interactive Windows session.'
-            }
             # Documented PreToolUse output: additionalContext reaches the model next to the tool result.
             $json = @{ hookSpecificOutput = @{ hookEventName = 'PreToolUse'; additionalContext = $msg } } | ConvertTo-Json -Compress
             $out = New-Object System.IO.StreamWriter([Console]::OpenStandardOutput(), (New-Object System.Text.UTF8Encoding $false))

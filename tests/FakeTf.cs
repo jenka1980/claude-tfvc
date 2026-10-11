@@ -4,6 +4,7 @@
 //   /stdout:TEXT   write TEXT + newline to stdout         /stderr:TEXT  write TEXT + newline to stderr
 //   /ansi          write Sample + newline to stdout as raw bytes in the system ANSI code page (what tf.exe does)
 //   /big           write 300 KB to stdout and 300 KB to stderr, interleaved (pipe-buffer deadlock check)
+//   <exe>.stderr  if present: its content is written to stderr and the exit code defaults to 100
 // Logs (UTF-8, no BOM):
 //   tf-calls.log   one line per call: "<tag> " + arguments joined by one space; <tag> = content of <exe>.tag if present
 //   tf-args.log    "--- call ---" then every argument on its own line
@@ -37,6 +38,8 @@ static class FakeTf
         Append(Path.Combine(dir, "tf-args.log"), sb.ToString());
 
         int exit = 0;
+        string errFile = exe + ".stderr";
+        if (File.Exists(errFile)) { Console.Error.Write(File.ReadAllText(errFile)); exit = 100; }
         foreach (var a in args)
         {
             if (a.StartsWith("/exit:", StringComparison.OrdinalIgnoreCase)) exit = int.Parse(a.Substring(6));

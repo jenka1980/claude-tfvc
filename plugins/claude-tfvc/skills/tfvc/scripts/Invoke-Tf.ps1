@@ -214,7 +214,14 @@ function Start-TfRelayWorker {
     param($Paths)
     switch ($env:CLAUDE_TFVC_RELAY_LAUNCH) {
         'child' {
-            Start-Process -FilePath 'powershell.exe' -WindowStyle Hidden -ArgumentList "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$($Paths.Worker)`"" | Out-Null
+            # A Windows PowerShell worker started from a pwsh client would otherwise inherit PowerShell 7's module
+            # path and fail to load Get-AuthenticodeSignature; the scheduled task starts clean, so only this test
+            # seam needs it.
+            $savedModulePath = $env:PSModulePath
+            try {
+                $env:PSModulePath = "$([Environment]::GetFolderPath('MyDocuments'))\WindowsPowerShell\Modules;$env:ProgramFiles\WindowsPowerShell\Modules;$env:SystemRoot\system32\WindowsPowerShell\v1.0\Modules"
+                Start-Process -FilePath 'powershell.exe' -WindowStyle Hidden -ArgumentList "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$($Paths.Worker)`"" | Out-Null
+            } finally { $env:PSModulePath = $savedModulePath }
             return $null
         }
         'noop' { return $null }
