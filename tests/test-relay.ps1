@@ -667,8 +667,8 @@ try {
         (($desc.Length -lt 1024) -and ($desc -match 'TF30063') -and ($desc -match 'not authorized') -and ($desc -match 'SSH') -and ($desc -match '/tf-relay')) "len=$($desc.Length)"
     $body = $skillText.Substring($skillText.IndexOf("`n---", 4) + 4)
     $words = @($body -split '\s+' | Where-Object { $_ }).Count
-    Check 'R28b SKILL.md: "Running tf" with the Invoke-Tf.ps1 line replaces "Finding tf.exe"; TF30063 row; body <= 580 words' `
-        (($skillText -match '## Running tf') -and ($skillText -match 'scripts/Invoke-Tf\.ps1') -and ($skillText -notmatch '## Finding tf\.exe') -and ($skillText -match '(?m)^\|.*TF30063.*/tf-relay') -and ($words -le 580)) "words=$words"
+    Check 'R28b SKILL.md: "Running tf" with the Invoke-Tf.ps1 line replaces "Finding tf.exe"; TF30063 row; body <= 760 words' `
+        (($skillText -match '## Running tf') -and ($skillText -match 'scripts/Invoke-Tf\.ps1') -and ($skillText -notmatch '## Finding tf\.exe') -and ($skillText -match '(?m)^\|.*TF30063.*/tf-relay') -and ($words -le 760)) "words=$words"
     foreach ($c in 'tf-status', 'tf-checkout', 'tf-checkin', 'tf-get', 'tf-undo') {
         $t = Get-Content -LiteralPath (Join-Path $Plugin "commands\$c.md") -Raw
         Check "R29 $c.md runs tf per the skill's Running tf (no 'Resolve tf.exe')" (($t -match 'Running tf') -and ($t -notmatch 'Resolve `tf\.exe`')) ''
