@@ -19,6 +19,9 @@ $Plugin    = Join-Path $Repo 'plugins\claude-tfvc'
 $Hook      = Join-Path $Plugin 'hooks\tfvc-checkout.ps1'
 $HooksJson = Join-Path $Plugin 'hooks\hooks.json'
 $FindTf    = Join-Path $Plugin 'skills\tfvc\scripts\Find-Tf.ps1'
+$InvokeTf  = Join-Path $Plugin 'skills\tfvc\scripts\Invoke-Tf.ps1'
+$Worker    = Join-Path $Plugin 'skills\tfvc\scripts\Tf-RelayWorker.ps1'
+$Register  = Join-Path $Plugin 'skills\tfvc\scripts\Register-TfRelay.ps1'
 $S         = $WorkDir
 New-Item -ItemType Directory -Path $S -Force | Out-Null
 $Log       = Join-Path $S 'tf-calls.log'
@@ -283,7 +286,7 @@ foreach ($exe in $Exes.Keys) {
 }
 
 # ---- static checks ------------------------------------------------------------------------
-foreach ($f in @($Hook, $FindTf)) {
+foreach ($f in @($Hook, $FindTf, $InvokeTf, $Worker, $Register)) {
     $name = Split-Path -Leaf $f
     if (Test-Path -LiteralPath $f) {
         $nonAscii = @([System.IO.File]::ReadAllBytes($f) | Where-Object { $_ -gt 0x7F }).Count

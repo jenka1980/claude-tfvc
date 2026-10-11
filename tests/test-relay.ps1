@@ -605,6 +605,30 @@ try {
         }
     } else { Skip 'R10/R11/R27 hook in relay mode' 'no fake tf.exe' }
 
+    # ---- Register-TfRelay.ps1: -Status under the seams, the task spec, decoded failure codes ---------------
+    $StatusEnv = Merge-Env $RelayOn @{ CLAUDE_PROJECT_DIR = $ProjNone }
+    if ($HaveFake) {
+        Reset-Relay; Wait-NoWorker
+        $r = Invoke-InChild 'powershell' $StatusEnv "& '$Register' -Status -NoProbe; exit `$LASTEXITCODE"
+        Check 'R17a -Status with the task (simulated) and no probe -> exit 0, reports transport and task' (($r.Exit -eq 0) -and ($r.Out -match '(?m)^Transport:\s+relay') -and ($r.Out -match 'simulated')) "exit=$($r.Exit) out=[$($r.Out)]"
+
+        $r = Invoke-InChild 'powershell' (Merge-Env $StatusEnv @{ CLAUDE_TFVC_RELAY_LAUNCH = 'none' }) "& '$Register' -Status -NoProbe; exit `$LASTEXITCODE"
+        Check 'R17b -Status without the task -> exit 1, NOT registered, the exact registration command, the RDP note' (($r.Exit -eq 1) -and ($r.Out -match 'NOT registered') -and ($r.Out -match 'Register-TfRelay\.ps1') -and ($r.Out -match 'interactive Windows session')) "exit=$($r.Exit) out=[$($r.Out)]"
+
+        Reset-FakeLog
+        $r = Invoke-InChild 'powershell' $StatusEnv "& '$Register' -Status; exit `$LASTEXITCODE"
+        $calls = @(Get-FakeCalls)
+        Check 'R17c -Status probes tf workspaces /noprompt through the relay and reports the time' (($r.Exit -eq 0) -and ($r.Out -match 'Probe:\s+tf workspaces /noprompt via relay: exit 0 in [\d.]+ s') -and ($calls.Count -eq 1) -and ($calls[0][0] -eq 'workspaces')) "exit=$($r.Exit) out=[$($r.Out)] calls=$($calls.Count)"
+        Wait-NoWorker
+    } else { Skip 'R17 Register-TfRelay.ps1 -Status' 'no fake tf.exe' }
+
+    $r = Invoke-InChild 'powershell' @{} ". '$Register'; `$s = Get-TfRelayTaskSpec -WorkerPath 'C:\x\w.ps1'; `"`$(`$s.TaskName)|`$(`$s.Execute)|`$(`$s.Argument)|`$(`$s.LogonType)|`$(`$s.RunLevel)|`$(`$s.MultipleInstances)|`$(`$s.ExecutionTimeLimit.TotalHours)|`$(@(`$s.Triggers).Count)|`$(`$s.WorkingDirectory)|`$(`$s.AllowStartIfOnBatteries)|`$(`$s.DontStopIfGoingOnBatteries)`""
+    $want = 'ClaudeTfvcRelay|powershell.exe|-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "C:\x\w.ps1"|Interactive|Limited|IgnoreNew|1|0|C:\x|True|True'
+    Check 'R18 task spec: name, hidden non-interactive powershell action, Interactive/Limited, IgnoreNew, 1 h, no triggers, battery OK' ($r.Out -eq $want) "got=[$($r.Out)]"
+
+    $r = Invoke-InChild 'powershell' @{} ". '$InvokeTf'; (ConvertTo-TfRelayFailureText 0x00041303) -match 'RDP'; (ConvertTo-TfRelayFailureText 0x8007052E) -match 'ogon'; (ConvertTo-TfRelayFailureText 0x80070569) -match 'policy'; (ConvertTo-TfRelayFailureText 0x800710E0) -match 'refused'; `$null -eq (ConvertTo-TfRelayFailureText 0)"
+    Check 'R19 LastTaskResult codes 0x41303 / 0x8007052E / 0x80070569 / 0x800710E0 decode to actionable text; 0 decodes to nothing' ((($r.Out -replace '\s', '') -eq 'TrueTrueTrueTrueTrue')) "out=[$($r.Out)]"
+
     # ---- report (keep this anchor last; later tasks insert their checks above it) --------------------
 }
 catch { Check 'HARNESS aborted by an exception (every check after this point was skipped)' $false "$($_.Exception.Message) at $($_.InvocationInfo.ScriptLineNumber)" }
