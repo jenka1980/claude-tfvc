@@ -433,19 +433,21 @@ try {
         try {
             for ($i = 1; $i -le 10; $i++) {
                 $cl = ConvertTo-CommandLine (@('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', $InvokeTf, 'status', "/stdout:marker-$i"))
-                $procs += Start-Process -FilePath $Exes.powershell -ArgumentList $cl -RedirectStandardOutput (Join-Path $S "par-$i.out") -NoNewWindow -PassThru
-                $null = $procs[-1].Handle   # caches the process handle: without it Windows PowerShell 5.1 reports a null ExitCode for a fast child
+                $p = Start-Process -FilePath $Exes.powershell -ArgumentList $cl -RedirectStandardOutput (Join-Path $S "par-$i.out") -RedirectStandardError (Join-Path $S "par-$i.err") -NoNewWindow -PassThru
+                $null = $p.Handle; $procs += $p   # touching the handle caches it: without it Windows PowerShell 5.1 reports a null ExitCode for a fast child
             }
         } finally { Restore-TestEnv $saved }
         foreach ($p in $procs) { $null = $p.WaitForExit(90000) }
         $okAll = $true
+        $bad = @()
         for ($i = 1; $i -le 10; $i++) {
-            $txt = (Get-Content -LiteralPath (Join-Path $S "par-$i.out") -Raw -Encoding UTF8).Trim()
-            if ($procs[$i - 1].ExitCode -ne 0 -or $txt -ne "marker-$i") { $okAll = $false }
+            $txt = "$(Get-Content -LiteralPath (Join-Path $S "par-$i.out") -Raw -Encoding UTF8)".Trim()
+            $errTxt = "$(Get-Content -LiteralPath (Join-Path $S "par-$i.err") -Raw -Encoding UTF8)".Trim()
+            if ($procs[$i - 1].ExitCode -ne 0 -or $txt -ne "marker-$i") { $okAll = $false; $bad += "client $i exit=$($procs[$i - 1].ExitCode) out=[$txt] err=[$errTxt]" }
         }
         $calls = @(Get-FakeCalls)
         $distinct = @($calls | ForEach-Object { $_[1] } | Sort-Object -Unique).Count
-        Check 'R5 10 parallel clients: each gets its own answer, 10 calls, none lost or duplicated' ($okAll -and ($calls.Count -eq 10) -and ($distinct -eq 10)) "ok=$okAll calls=$($calls.Count) distinct=$distinct exits=[$(($procs | ForEach-Object { $_.ExitCode }) -join ',')]"
+        Check 'R5 10 parallel clients: each gets its own answer, 10 calls, none lost or duplicated' ($okAll -and ($calls.Count -eq 10) -and ($distinct -eq 10)) "ok=$okAll calls=$($calls.Count) distinct=$distinct exits=[$(($procs | ForEach-Object { $_.ExitCode }) -join ',')] $($bad -join ' ; ')"
 
         # R7: nobody picks the request up -> 124, request deleted, a later worker finds nothing
         Wait-NoWorker; Reset-Relay; Reset-FakeLog
@@ -488,6 +490,28 @@ try {
         Reset-Relay; Wait-NoWorker
         $r = Invoke-Launcher 'powershell' $RelayOn @('status', '/stdout:fresh')
         Check 'R16b relay folder absent -> created, worker installed, request served' (($r.Exit -eq 0) -and ($r.Out.Trim() -eq 'fresh') -and (Test-Path -LiteralPath (Join-Path $Relay 'Tf-RelayWorker.ps1'))) "exit=$($r.Exit) out=[$($r.Out.Trim())]"
+
+        # R16c: ten clients install the worker at the same time from an empty relay folder; none may fail.
+        Reset-Relay; Wait-NoWorker
+        $instOut = foreach ($i in 1..10) { Join-Path $S "inst-$i.out" }
+        $saved = Set-TestEnv $RelayOn
+        $ips = @()
+        try {
+            for ($i = 1; $i -le 10; $i++) {
+                $cl = ConvertTo-CommandLine (@('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', ". '$InvokeTf'; `$p = Get-TfRelayPaths; `$null = Install-TfRelayWorker -Paths `$p; if (Test-Path -LiteralPath `$p.Worker) { 'installed' } else { 'missing' }"))
+                $p = Start-Process -FilePath $Exes.powershell -ArgumentList $cl -RedirectStandardOutput $instOut[$i - 1] -RedirectStandardError (Join-Path $S "inst-$i.err") -NoNewWindow -PassThru
+                $null = $p.Handle; $ips += $p
+            }
+        } finally { Restore-TestEnv $saved }
+        foreach ($p in $ips) { $null = $p.WaitForExit(60000) }
+        $instBad = @()
+        for ($i = 1; $i -le 10; $i++) {
+            $o = "$(Get-Content -LiteralPath $instOut[$i - 1] -Raw -Encoding UTF8)".Trim()
+            $e = "$(Get-Content -LiteralPath (Join-Path $S "inst-$i.err") -Raw -Encoding UTF8)".Trim()
+            if ($ips[$i - 1].ExitCode -ne 0 -or $o -ne 'installed' -or $e) { $instBad += "client $i exit=$($ips[$i - 1].ExitCode) out=[$o] err=[$e]" }
+        }
+        $verOk = (Get-Content -LiteralPath (Join-Path $Relay 'worker.version') -Raw) -match "sha256=$((Get-FileHash -LiteralPath $Worker -Algorithm SHA256).Hash)"
+        Check 'R16c ten concurrent worker installs from an empty relay folder all succeed and leave a consistent worker.version' (($instBad.Count -eq 0) -and $verOk) (($instBad -join ' ; ') + " verOk=$verOk")
 
         # R26: relay forced, task missing -> 120 with the registration command
         $r = Invoke-Launcher 'powershell' (Merge-Env $RelayOn @{ CLAUDE_TFVC_RELAY_LAUNCH = 'none' }) @('status')

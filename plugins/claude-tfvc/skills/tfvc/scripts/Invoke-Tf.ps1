@@ -202,8 +202,19 @@ function Install-TfRelayWorker {
     }
     if ($installed -eq $hash -and (Test-Path -LiteralPath $Paths.Worker -PathType Leaf)) { return $false }
     $tmp = "$($Paths.Worker).$([guid]::NewGuid().ToString('n')).tmp"
-    Copy-Item -LiteralPath $Paths.Source -Destination $tmp -ErrorAction Stop
-    Move-Item -LiteralPath $tmp -Destination $Paths.Worker -Force -ErrorAction Stop
+    try {
+        Copy-Item -LiteralPath $Paths.Source -Destination $tmp -ErrorAction Stop
+        if (Test-Path -LiteralPath $Paths.Worker -PathType Leaf) { [System.IO.File]::Replace($tmp, $Paths.Worker, [NullString]::Value) }   # atomic on NTFS; PowerShell turns a plain $null into "" for a string parameter, which Replace rejects
+        else { [System.IO.File]::Move($tmp, $Paths.Worker) }
+    }
+    catch {
+        # Another client may have installed the same file an instant ago: then this one has nothing to do.
+        Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+        $installedNow = ''
+        if (Test-Path -LiteralPath $Paths.Worker -PathType Leaf) { $installedNow = (Get-FileHash -LiteralPath $Paths.Worker -Algorithm SHA256 -ErrorAction SilentlyContinue).Hash }
+        if ($installedNow -eq $hash) { return $false }
+        throw
+    }
     Set-Content -LiteralPath $Paths.Version -Value @("version=$(Get-TfPluginVersion)", "sha256=$hash") -Encoding Ascii
     return $true
 }
@@ -277,8 +288,11 @@ function Invoke-TfRelay {
     $now = [DateTime]::UtcNow
     $request = [ordered]@{ protocol = $TfvcRelayProtocol; id = $id; tf = $Tf; args = @($Arguments); cwd = $WorkingDirectory; createdUtc = $now.ToString('o'); expiresUtc = $now.AddSeconds($PickupTimeoutSec).ToString('o') }
     $tmp = "$reqPath.tmp"
-    [System.IO.File]::WriteAllText($tmp, ($request | ConvertTo-Json -Depth 4 -Compress), (New-Object System.Text.UTF8Encoding $false))
-    Move-Item -LiteralPath $tmp -Destination $reqPath -Force
+    try {
+        [System.IO.File]::WriteAllText($tmp, ($request | ConvertTo-Json -Depth 4 -Compress), (New-Object System.Text.UTF8Encoding $false))
+        Move-Item -LiteralPath $tmp -Destination $reqPath -Force -ErrorAction Stop
+    }
+    catch { return New-TfResult -ExitCode 120 -Transport 'relay' -Diagnostic "claude-tfvc: cannot write the relay request under $($paths.Queue): $($_.Exception.Message)" }
 
     $watch = [System.Diagnostics.Stopwatch]::StartNew()
     $lastKick = $null; $firstKick = $null
@@ -291,6 +305,8 @@ function Invoke-TfRelay {
                 if ($res.error) { return New-TfResult -ExitCode 120 -Transport 'relay' -StdOut "$($res.stdout)" -StdErr "$($res.stderr)" -Diagnostic "claude-tfvc: relay worker $($res.workerVersion): $($res.error)" }
                 return New-TfResult -ExitCode ([int]$res.exitCode) -StdOut "$($res.stdout)" -StdErr "$($res.stderr)" -Transport 'relay'
             }
+            Remove-Item -LiteralPath $resPath -Force -ErrorAction SilentlyContinue
+            return New-TfResult -ExitCode 120 -Transport 'relay' -Diagnostic 'claude-tfvc: the relay response could not be read (unreadable JSON); see worker.log in the relay folder'
         }
         if (-not $claimed) {
             if (-not (Test-Path -LiteralPath $reqPath)) { $claimed = $true; continue }
