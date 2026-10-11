@@ -677,6 +677,17 @@ try {
     Check 'R30 tf-relay.md: frontmatter, -Status, explicit yes before registering, settings.local.json merge, never ~/.claude/settings.json' `
         (($relayCmd -match '(?s)^---\r?\ndescription:.*argument-hint:.*?\r?\n---') -and ($relayCmd -match 'Register-TfRelay\.ps1" -Status') -and ($relayCmd -match 'only after an explicit yes') -and ($relayCmd -match 'settings\.local\.json') -and ($relayCmd -match 'Never edit `~/\.claude/settings\.json`')) ''
 
+    # ---- docs: README, CLAUDE.md, versions ----------------------------------------------------------------
+    $readme = Get-Content -LiteralPath (Join-Path $Repo 'README.md') -Raw
+    Check 'R31a README has "Remote sessions (SSH)" with TF30063, TFVC_TRANSPORT, /tf-relay, the RDP note and the permissions example' `
+        (($readme -match '## Remote sessions \(SSH\)') -and ($readme -match 'TF30063') -and ($readme -match 'TFVC_TRANSPORT') -and ($readme -match '/tf-relay') -and ($readme -match 'RDP') -and ($readme -match 'Invoke-Tf\.ps1\*checkin')) ''
+    Check 'R31b README commands table lists /tf-relay and the tests section names test-relay.ps1' (($readme -match '\| `/tf-relay') -and ($readme -match 'test-relay\.ps1')) ''
+    $claudeMd = Get-Content -LiteralPath (Join-Path $Repo 'CLAUDE.md') -Raw
+    Check 'R31c CLAUDE.md records the new invariants (launcher, byte-transparent direct, signed tf.exe, expired requests, duplicate quoting function)' `
+        (($claudeMd -match 'Invoke-Tf\.ps1') -and ($claudeMd -match 'byte') -and ($claudeMd -match 'signed') -and ($claudeMd -match 'expired') -and ($claudeMd -match 'ConvertTo-CommandLine')) ''
+    $vPlugin = (Get-Content -LiteralPath (Join-Path $Plugin '.claude-plugin\plugin.json') -Raw | ConvertFrom-Json).version
+    Check 'R31d plugin version is 0.4.0' ($vPlugin -eq '0.4.0') "version=$vPlugin"
+
     # ---- report (keep this anchor last; later tasks insert their checks above it) --------------------
 }
 catch { Check 'HARNESS aborted by an exception (every check after this point was skipped)' $false "$($_.Exception.Message) at $($_.InvocationInfo.ScriptLineNumber)" }

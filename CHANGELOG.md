@@ -2,6 +2,29 @@
 
 All notable changes to this project are documented here. Versioning follows [SemVer](https://semver.org/).
 
+## [0.4.0] - 2026-10-11
+### Added
+- Relay transport for sessions without network credentials (SSH key logon, VS Code Remote-SSH), where `tf.exe`
+  fails with `TF30063: not authorized`: `skills/tfvc/scripts/Invoke-Tf.ps1` hands each `tf` call to
+  `Tf-RelayWorker.ps1`, which the scheduled task `ClaudeTfvcRelay` runs in the user's interactive Windows session.
+  Per-user file queue, one file per request, expired requests never run, the worker copy is refreshed
+  automatically after plugin updates (no re-registration).
+- `/tf-relay [status|on|off|auto]`: diagnostics (task state, decoded `LastTaskResult`, timed probe), one-time
+  registration after confirmation, and the `TFVC_TRANSPORT` project setting (`auto` by default).
+- `skills/tfvc/scripts/Register-TfRelay.ps1`: register / `-Unregister` / `-Status`.
+- `tests/test-relay.ps1` and a shared compiled fake `tf.exe` (`tests/FakeTf.cs`) used by both harnesses.
+### Changed
+- The skill and the `/tf-*` commands run `tf` through `Invoke-Tf.ps1` instead of a resolved `tf.exe` path. In
+  direct mode the child inherits stdout, stderr is relayed byte for byte, and exit codes are `tf`'s own; the
+  launcher's failures use 120 (relay unavailable), 124 (relay timeout), 127 (no `tf.exe`).
+- The hook calls the launcher and, when checkout fails, tells Claude why through `additionalContext` (TF30063 →
+  run `/tf-relay`; task not started → log in over RDP once). `hooks.json` timeout 30 s → 45 s.
+- `Find-Tf.ps1`: `Get-ProjectEnvSetting` reads any `env.<Name>` from the project settings (`TF_EXE`,
+  `TFVC_TRANSPORT`); the resolution order is unchanged.
+### Security
+- The relay worker runs only a Microsoft-signed executable named `tf.exe`, from an argument array, with
+  `/noprompt` forced and stdin closed; no credentials are stored; comments and output are never logged.
+
 ## [0.3.0] - 2026-09-24
 ### Added
 - `/tf-select`: pick which TF.exe a project uses. Lists the TF.exe versions found on the machine and writes the
