@@ -2,6 +2,17 @@
 
 All notable changes to this project are documented here. Versioning follows [SemVer](https://semver.org/).
 
+## [0.4.1] - 2026-10-12
+### Fixed
+- `tests/test-hook.ps1` pins `TFVC_TRANSPORT=direct`. The harness covers `tf.exe` resolution and the read-only
+  hook, never the transport, but it never pinned one: left at `auto`, a run from an SSH session with the relay
+  task registered resolved to relay and failed 19 of its 63 checks, because the worker correctly refuses the
+  harness's fake `tf.exe` under `%TEMP%`. The plugin itself was never affected. Relay coverage stays in
+  `tests/test-relay.ps1`.
+- `tests/test-relay.ps1` check R31d accepts version 0.4.0 or later instead of pinning 0.4.0 exactly, so a patch
+  release no longer fails it; `test-hook.ps1` T11 still requires both manifests and the newest changelog entry
+  to agree.
+
 ## [0.4.0] - 2026-10-11
 ### Added
 - Relay transport for sessions without network credentials (SSH key logon, VS Code Remote-SSH), where `tf.exe`
@@ -33,10 +44,6 @@ All notable changes to this project are documented here. Versioning follows [Sem
   a locked `worker.version`. On pwsh the launcher decodes `tf` output with the system ANSI code page.
 - `/tf-relay on` still writes `relay` when registration is declined and warns about exit 120; the exported
   `TFVC_TRANSPORT` variable needs a session restart, the settings file is read on every call.
-- `tests/test-hook.ps1` pins `TFVC_TRANSPORT=direct`: it covers `tf.exe` resolution and the read-only hook, and
-  left to `auto` it failed 19 of its 63 checks when run from an SSH session with the relay registered, because
-  the worker correctly refuses the harness's fake `tf.exe` under `%TEMP%`. Relay coverage stays in
-  `tests/test-relay.ps1`.
 ### Security
 - The relay worker runs only a Microsoft-signed executable named `tf.exe`, from an argument array, with
   `/noprompt` forced and stdin closed; no credentials are stored; comments and output are never logged.

@@ -765,7 +765,7 @@ try {
     Check 'R31c CLAUDE.md records the new invariants (launcher, byte-transparent direct, signed tf.exe, expired requests, duplicate quoting function)' `
         (($claudeMd -match 'Invoke-Tf\.ps1') -and ($claudeMd -match 'byte') -and ($claudeMd -match 'signed') -and ($claudeMd -match 'expired') -and ($claudeMd -match 'ConvertTo-CommandLine')) ''
     $vPlugin = (Get-Content -LiteralPath (Join-Path $Plugin '.claude-plugin\plugin.json') -Raw | ConvertFrom-Json).version
-    Check 'R31d plugin version is 0.4.0' ($vPlugin -eq '0.4.0') "version=$vPlugin"
+    Check 'R31d plugin version is 0.4.0 or later (the release that introduced the relay); test-hook T11 checks the manifests and the changelog agree' ([version]$vPlugin -ge [version]'0.4.0') "version=$vPlugin"
 
     # ---- report (keep this anchor last; later tasks insert their checks above it) --------------------
 }
