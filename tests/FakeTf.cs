@@ -15,7 +15,7 @@ using System.Threading;
 
 static class FakeTf
 {
-    public const string Sample = "shalom-שלום-privet-Привет";
+    public const string Sample = "shalom-\u05E9\u05DC\u05D5\u05DD-privet-\u041F\u0440\u0438\u0432\u0435\u0442";
 
     static void Append(string path, string text)
     {
