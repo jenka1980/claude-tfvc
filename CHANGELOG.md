@@ -21,9 +21,28 @@ All notable changes to this project are documented here. Versioning follows [Sem
   run `/tf-relay`; task not started → log in over RDP once). `hooks.json` timeout 30 s → 45 s.
 - `Find-Tf.ps1`: `Get-ProjectEnvSetting` reads any `env.<Name>` from the project settings (`TF_EXE`,
   `TFVC_TRANSPORT`); the resolution order is unchanged.
+- The hook stays silent, as in 0.3.0, when no `tf.exe` exists at all (a project with read-only files is not
+  necessarily a TFVC project).
+- Relay diagnostics name the real cause: "the relay worker is busy with an earlier tf command, retry" when another
+  request is running, "the relay worker stopped while tf was running; check tf status" within about two seconds of
+  a dead worker, and the unreadable-response error warns that `tf` may already have run. `worker.log` records `?`
+  instead of a first argument that is not a plain word, so it never holds a path.
+- `worker.version` is refreshed when only the plugin version changes; `-Status` says "matches the plugin" only
+  when both the hash and the version match, reads the current directory's project settings when
+  `CLAUDE_PROJECT_DIR` is unset, and shows the task's principal. Concurrent first-time installs no longer fail on
+  a locked `worker.version`. On pwsh the launcher decodes `tf` output with the system ANSI code page.
+- `/tf-relay on` still writes `relay` when registration is declined and warns about exit 120; the exported
+  `TFVC_TRANSPORT` variable needs a session restart, the settings file is read on every call.
 ### Security
 - The relay worker runs only a Microsoft-signed executable named `tf.exe`, from an argument array, with
   `/noprompt` forced and stdin closed; no credentials are stored; comments and output are never logged.
+- The worker starts `tf.exe` only from under Program Files, a Visual Studio installation that `vswhere` reports,
+  or a folder listed in `CLAUDE_TFVC_RELAY_TRUSTED_ROOTS` in the worker's own environment (a repository's
+  settings cannot reach it), so a signed `TF.exe` copied beside foreign assemblies is refused. The signer check is
+  anchored to the `O=Microsoft Corporation` field; the signature verdict is cached per file version, never per path
+  alone; only absolute paths are accepted. `CLAUDE_TFVC_RELAY_ALLOW_UNSIGNED=1` skips the signature check only.
+- A `ClaudeTfvcRelay` task registered for another user of the machine counts as not registered for you; `-Status`
+  shows the principal and the mismatch.
 
 ## [0.3.0] - 2026-09-24
 ### Added
