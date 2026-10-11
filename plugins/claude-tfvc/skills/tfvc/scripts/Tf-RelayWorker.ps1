@@ -86,18 +86,23 @@ function Write-JsonAtomic {
 }
 
 function Test-TfExecutable {
-    # $null when the file may run, otherwise the refusal text. Only tf.exe, only Microsoft-signed; cached per path.
+    # $null when the file may run, otherwise the refusal text. Only tf.exe, only Microsoft-signed, only an absolute
+    # path; the verdict is cached per path and file version (a replaced file is checked again).
     param([string]$Path)
     if ([System.IO.Path]::GetFileName($Path) -ine 'tf.exe') { return "refusing to run '$Path': the executable must be named tf.exe" }
+    if (-not [System.IO.Path]::IsPathRooted($Path)) { return "refusing to run '$Path': the tf.exe path must be absolute" }
+    $Path = [System.IO.Path]::GetFullPath($Path)
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return "tf.exe not found at '$Path'" }
     if ($env:CLAUDE_TFVC_RELAY_ALLOW_UNSIGNED -eq '1') { return $null }
-    if ($VerifiedTf.ContainsKey($Path)) { return $VerifiedTf[$Path] }
+    $item = Get-Item -LiteralPath $Path
+    $key = "$Path|$($item.LastWriteTimeUtc.Ticks)|$($item.Length)"
+    if ($VerifiedTf.ContainsKey($key)) { return $VerifiedTf[$key] }
     $sig = Get-AuthenticodeSignature -LiteralPath $Path
     $verdict = $null
     if ($sig.Status -ne 'Valid' -or "$($sig.SignerCertificate.Subject)" -notmatch 'O=Microsoft Corporation') {
         $verdict = "refusing to run '$Path': not a Microsoft-signed tf.exe (signature status: $($sig.Status))"
     }
-    $VerifiedTf[$Path] = $verdict
+    $VerifiedTf[$key] = $verdict
     return $verdict
 }
 
@@ -129,7 +134,7 @@ function Invoke-RelayRequest {
                 if (-not ($argList | Where-Object { $_ -match '^[/-]noprompt$' })) { $argList += '/noprompt' }
                 $ansi = Get-AnsiEncoding
                 $psi = New-Object System.Diagnostics.ProcessStartInfo
-                $psi.FileName = "$($req.tf)"
+                $psi.FileName = [System.IO.Path]::GetFullPath("$($req.tf)")
                 $psi.Arguments = ConvertTo-CommandLine $argList
                 $psi.UseShellExecute = $false
                 $psi.CreateNoWindow = $true

@@ -291,14 +291,35 @@ try {
         $w = Invoke-WorkerRequest (New-Request @('status') @{ tf = $NotTf })
         Check 'R12b an executable not named tf.exe is refused even with the bypass' (($w.Calls.Count -eq 0) -and ($w.Res.error -match 'must be named tf.exe')) "error=[$($w.Res.error)]"
 
+        $w = Invoke-WorkerRequest (New-Request @('status') @{ tf = 'tf.exe' })
+        Check 'R12d a relative tf.exe path is refused (the checked file and the started file could differ)' (($w.Calls.Count -eq 0) -and ("$($w.Res.error)" -match 'must be absolute')) "error=[$($w.Res.error)]"
+
+        # R12e: the signature verdict is per file version, not per path: a signed tf.exe swapped for an unsigned one is refused.
+        $realTf = "$env:TF_EXE".Trim('"')
+        if ($realTf -and (Test-Path -LiteralPath $realTf) -and (Get-AuthenticodeSignature -LiteralPath $realTf).Status -eq 'Valid') {
+            $swapDir = Join-Path $S 'swap'; New-Item -ItemType Directory -Path $swapDir -Force | Out-Null
+            $swapTf = Join-Path $swapDir 'tf.exe'
+            Copy-Item -LiteralPath $realTf -Destination $swapTf -Force
+            $first = New-Request @('help') @{ tf = $swapTf }
+            $second = New-Request @('status') @{ tf = $swapTf }
+            $cmd = ". '$Worker'; `$runA = Join-Path '$Queue' '$($first.id).run.json'; `$runB = Join-Path '$Queue' '$($second.id).run.json'; Invoke-RelayRequest -RunPath `$runA; Copy-Item -LiteralPath '$FakeTf' -Destination '$swapTf' -Force; Invoke-RelayRequest -RunPath `$runB"
+            New-Item -ItemType Directory -Path $Queue -Force | Out-Null
+            [System.IO.File]::WriteAllText((Join-Path $Queue "$($first.id).run.json"), ($first | ConvertTo-Json -Depth 4 -Compress), $Utf8)
+            [System.IO.File]::WriteAllText((Join-Path $Queue "$($second.id).run.json"), ($second | ConvertTo-Json -Depth 4 -Compress), $Utf8)
+            $r = Invoke-InChild 'powershell' @{ CLAUDE_TFVC_RELAY_ROOT = $Relay; CLAUDE_TFVC_RELAY_ALLOW_UNSIGNED = $null } $cmd
+            $resA = Get-Content -LiteralPath (Join-Path $Queue "$($first.id).res.json") -Raw | ConvertFrom-Json
+            $resB = Get-Content -LiteralPath (Join-Path $Queue "$($second.id).res.json") -Raw | ConvertFrom-Json
+            Check 'R12e a signed tf.exe passes, then the same path swapped for an unsigned file is refused within one worker life' (($null -eq $resA.error) -and ("$($resB.error)" -match 'not a Microsoft-signed')) "A.error=[$($resA.error)] B.error=[$($resB.error)]"
+        } else { Skip 'R12e signature re-check after a file swap' 'no Microsoft-signed tf.exe found on this machine' }
+
         $w = Invoke-WorkerRequest (New-Request @('status', '/ansi'))
-        Check 'R4 ANSI (Hebrew/Cyrillic) stdout is decoded to Unicode in the response' ($w.Res.stdout.StartsWith($SampleRT)) "stdout=[$($w.Res.stdout.Trim())] want=[$SampleRT]"
+        Check 'R4 ANSI (Hebrew/Cyrillic) stdout is decoded to Unicode in the response' ("$($w.Res.stdout)".StartsWith($SampleRT)) "stdout=[$("$($w.Res.stdout)".Trim())] want=[$SampleRT]"
 
         $w = Invoke-WorkerRequest (New-Request @('status') @{ protocol = 2 })
         Check 'R20 unknown protocol -> error naming both versions, tf not run' (($w.Calls.Count -eq 0) -and ($w.Res.error -match 'protocol 2 is not supported') -and ($w.Res.error -match 'protocol 1')) "error=[$($w.Res.error)]"
 
         $w = Invoke-WorkerRequest (New-Request @('status', '/exit:100', '/stderr:boom'))
-        Check 'R34 exit code and stderr pass through the response' (($w.Res.exitCode -eq 100) -and ($w.Res.stderr -match 'boom') -and (-not $w.RunLeft)) "exit=$($w.Res.exitCode) stderr=[$($w.Res.stderr.Trim())]"
+        Check 'R34 exit code and stderr pass through the response' (($w.Res.exitCode -eq 100) -and ($w.Res.stderr -match 'boom') -and (-not $w.RunLeft)) "exit=$($w.Res.exitCode) stderr=[$("$($w.Res.stderr)".Trim())]"
 
         $w = Invoke-WorkerRequest (New-Request @('checkin', '/comment:secret-comment', 'D:\secret\path.cs'))
         $line = @($w.Log -split "`r?`n" | Where-Object { $_ -match $w.Res.id }) | Select-Object -Last 1
@@ -321,6 +342,7 @@ try {
 
     # ---- report (keep this anchor last; later tasks insert their checks above it) --------------------
 }
+catch { Check 'HARNESS aborted by an exception (every check after this point was skipped)' $false "$($_.Exception.Message) at $($_.InvocationInfo.ScriptLineNumber)" }
 finally { [Console]::InputEncoding = $savedEnc }
 
 $Results | Format-Table -AutoSize -Wrap | Out-String -Width 220
