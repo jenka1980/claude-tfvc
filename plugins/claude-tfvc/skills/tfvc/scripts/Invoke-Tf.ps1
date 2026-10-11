@@ -86,11 +86,12 @@ function Test-TfRelayTaskRegistered {
 function ConvertTo-TfRelayFailureText {
     # Task Scheduler LastTaskResult values met in practice (One.Net prototype), in words a user can act on.
     param([int64]$Code)
+    $Code = [int64]$Code -band 0xFFFFFFFFL   # a bare 0x8007052E literal is a negative Int32; the scheduler yields the UInt32 value
     switch ($Code) {
-        0x00041303 { return 'the relay task could not start because you are not logged on to Windows interactively; connect once over RDP (you may disconnect afterwards, but do not sign out)' }
-        0x8007052E { return 'logon failure: the relay task''s user does not match the current account or the password changed; re-run Register-TfRelay.ps1' }
-        0x80070569 { return 'this logon type is denied for scheduled tasks by domain policy' }
-        0x800710E0 { return 'the relay task refused to start (policy or task conditions); check Task Scheduler' }
+        0x00041303L { return 'the relay task could not start because you are not logged on to Windows interactively; connect once over RDP (you may disconnect afterwards, but do not sign out)' }
+        0x8007052EL { return 'logon failure: the relay task''s user does not match the current account or the password changed; re-run Register-TfRelay.ps1' }
+        0x80070569L { return 'this logon type is denied for scheduled tasks by domain policy' }
+        0x800710E0L { return 'the relay task refused to start (policy or task conditions); check Task Scheduler' }
     }
     return $null
 }
