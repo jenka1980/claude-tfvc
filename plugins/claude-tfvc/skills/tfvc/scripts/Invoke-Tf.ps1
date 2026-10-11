@@ -189,10 +189,143 @@ function Invoke-TfDirect {
     return New-TfResult -ExitCode $p.ExitCode -StdErr $ansi.GetString($kept.ToArray()) -Transport 'direct'
 }
 
+function Install-TfRelayWorker {
+    # Installs or refreshes the single-file worker copy the scheduled task runs. SHA-256 of the plugin's copy
+    # versus worker.version decides (not the version number, so development iterations refresh too).
+    param($Paths)
+    New-Item -ItemType Directory -Path $Paths.Queue -Force | Out-Null
+    $hash = (Get-FileHash -LiteralPath $Paths.Source -Algorithm SHA256 -ErrorAction Stop).Hash
+    $installed = ''
+    if (Test-Path -LiteralPath $Paths.Version -PathType Leaf) {
+        $m = [regex]::Match((Get-Content -LiteralPath $Paths.Version -Raw), '(?m)^sha256=(\w+)')
+        if ($m.Success) { $installed = $m.Groups[1].Value }
+    }
+    if ($installed -eq $hash -and (Test-Path -LiteralPath $Paths.Worker -PathType Leaf)) { return $false }
+    $tmp = "$($Paths.Worker).$([guid]::NewGuid().ToString('n')).tmp"
+    Copy-Item -LiteralPath $Paths.Source -Destination $tmp -ErrorAction Stop
+    Move-Item -LiteralPath $tmp -Destination $Paths.Worker -Force -ErrorAction Stop
+    Set-Content -LiteralPath $Paths.Version -Value @("version=$(Get-TfPluginVersion)", "sha256=$hash") -Encoding Ascii
+    return $true
+}
+
+function Start-TfRelayWorker {
+    # Kicks the worker: the scheduled task, or under the test seams a child powershell.exe / nothing.
+    # Returns $null on success, otherwise the text to show the user.
+    param($Paths)
+    switch ($env:CLAUDE_TFVC_RELAY_LAUNCH) {
+        'child' {
+            Start-Process -FilePath 'powershell.exe' -WindowStyle Hidden -ArgumentList "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$($Paths.Worker)`"" | Out-Null
+            return $null
+        }
+        'noop' { return $null }
+        'none' { return (Get-TfRegistrationHint) }
+    }
+    try { Start-ScheduledTask -TaskName $TfvcRelayTask -ErrorAction Stop; return $null }
+    catch {
+        if (-not (Test-TfRelayTaskRegistered)) { return (Get-TfRegistrationHint) }
+        return "Start-ScheduledTask $TfvcRelayTask failed: $($_.Exception.Message)"
+    }
+}
+
+function Get-TfRelayTaskInfo {
+    # State and last result of the task; $null under a test seam (no scheduler involved).
+    if ($env:CLAUDE_TFVC_RELAY_LAUNCH) { return $null }
+    try {
+        $task = Get-ScheduledTask -TaskName $TfvcRelayTask -ErrorAction Stop
+        $info = Get-ScheduledTaskInfo -TaskName $TfvcRelayTask -ErrorAction Stop
+        return [pscustomobject]@{ Registered = $true; State = "$($task.State)"; LastRunTime = $info.LastRunTime; LastTaskResult = [int64]$info.LastTaskResult }
+    } catch { return [pscustomobject]@{ Registered = $false; State = 'not registered'; LastRunTime = $null; LastTaskResult = [int64]0 } }
+}
+
+function Format-TfTaskState {
+    param($Info)
+    if (-not $Info) { return 'task state unknown (CLAUDE_TFVC_RELAY_LAUNCH test mode)' }
+    if (-not $Info.Registered) { return 'task not registered' }
+    $text = "task state $($Info.State), last result 0x$('{0:X8}' -f $Info.LastTaskResult)"
+    $why = ConvertTo-TfRelayFailureText $Info.LastTaskResult
+    if ($why) { $text += " ($why)" }
+    return $text
+}
+
+function Read-TfRelayJson {
+    # The worker renames complete files into place, but a reader can still race the rename on some filesystems.
+    param([string]$Path)
+    for ($i = 0; $i -lt 10; $i++) {
+        try { return (Get-Content -LiteralPath $Path -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop) }
+        catch { Start-Sleep -Milliseconds 50 }
+    }
+    return $null
+}
+
 function Invoke-TfRelay {
-    # Replaced by the real relay client in the next step of the work (Task 7 of the plan).
+    # Writes <id>.req.json, wakes the worker, waits for <id>.res.json. See the design doc, section 8.
     param([string]$Tf, [string[]]$Arguments, [string]$WorkingDirectory, [int]$TimeoutSec = 600, [int]$PickupTimeoutSec = 30)
-    return New-TfResult -ExitCode 120 -Transport 'relay' -Diagnostic 'claude-tfvc: relay client not available in this build'
+    $paths = Get-TfRelayPaths
+    try { Install-TfRelayWorker -Paths $paths | Out-Null }
+    catch { return New-TfResult -ExitCode 120 -Transport 'relay' -Diagnostic "claude-tfvc: cannot install the relay worker under $($paths.Root): $($_.Exception.Message)" }
+    $id = [guid]::NewGuid().ToString('n')
+    $reqPath = Join-Path $paths.Queue "$id.req.json"
+    $runPath = Join-Path $paths.Queue "$id.run.json"
+    $resPath = Join-Path $paths.Queue "$id.res.json"
+    $now = [DateTime]::UtcNow
+    $request = [ordered]@{ protocol = $TfvcRelayProtocol; id = $id; tf = $Tf; args = @($Arguments); cwd = $WorkingDirectory; createdUtc = $now.ToString('o'); expiresUtc = $now.AddSeconds($PickupTimeoutSec).ToString('o') }
+    $tmp = "$reqPath.tmp"
+    [System.IO.File]::WriteAllText($tmp, ($request | ConvertTo-Json -Depth 4 -Compress), (New-Object System.Text.UTF8Encoding $false))
+    Move-Item -LiteralPath $tmp -Destination $reqPath -Force
+
+    $watch = [System.Diagnostics.Stopwatch]::StartNew()
+    $lastKick = $null; $firstKick = $null
+    $claimed = $false; $goneSince = $null
+    while ($true) {
+        if (Test-Path -LiteralPath $resPath) {
+            $res = Read-TfRelayJson $resPath
+            if ($res) {
+                Remove-Item -LiteralPath $resPath -Force -ErrorAction SilentlyContinue
+                if ($res.error) { return New-TfResult -ExitCode 120 -Transport 'relay' -StdOut "$($res.stdout)" -StdErr "$($res.stderr)" -Diagnostic "claude-tfvc: relay worker $($res.workerVersion): $($res.error)" }
+                return New-TfResult -ExitCode ([int]$res.exitCode) -StdOut "$($res.stdout)" -StdErr "$($res.stderr)" -Transport 'relay'
+            }
+        }
+        if (-not $claimed) {
+            if (-not (Test-Path -LiteralPath $reqPath)) { $claimed = $true; continue }
+            $alive = Test-TfRelayWorkerAlive $paths
+            if (-not $alive -and ($null -eq $lastKick -or ($watch.Elapsed - $lastKick).TotalSeconds -ge 2)) {
+                $kickError = Start-TfRelayWorker -Paths $paths     # also closes the lost-wakeup gap on re-kicks
+                $lastKick = $watch.Elapsed
+                if ($null -eq $firstKick) { $firstKick = $lastKick }
+                if ($kickError) {
+                    Remove-Item -LiteralPath $reqPath -Force -ErrorAction SilentlyContinue
+                    return New-TfResult -ExitCode 120 -Transport 'relay' -Diagnostic "claude-tfvc: $kickError"
+                }
+            }
+            if (-not $alive -and $null -ne $firstKick -and ($watch.Elapsed - $firstKick).TotalSeconds -ge 5) {
+                $info = Get-TfRelayTaskInfo
+                if ($info -and $info.Registered -and $info.State -ne 'Running' -and (ConvertTo-TfRelayFailureText $info.LastTaskResult)) {
+                    Remove-Item -LiteralPath $reqPath -Force -ErrorAction SilentlyContinue
+                    return New-TfResult -ExitCode 120 -Transport 'relay' -Diagnostic "claude-tfvc: $(Format-TfTaskState $info)"
+                }
+            }
+            if ($watch.Elapsed.TotalSeconds -ge $PickupTimeoutSec) {
+                Remove-Item -LiteralPath $reqPath -Force -ErrorAction SilentlyContinue
+                if (-not (Test-Path -LiteralPath $runPath) -and -not (Test-Path -LiteralPath $resPath)) {
+                    $workerNote = if (Test-TfRelayWorkerAlive $paths) { 'a worker is running but did not pick the request up (see worker.log in the relay folder)' } else { 'no worker started' }
+                    return New-TfResult -ExitCode 124 -Transport 'relay' -Diagnostic "claude-tfvc: relay timeout: waited $PickupTimeoutSec s for pickup; $workerNote; $(Format-TfTaskState (Get-TfRelayTaskInfo))"
+                }
+                $claimed = $true   # the worker renamed it in that instant
+            }
+        }
+        else {
+            if (-not (Test-Path -LiteralPath $runPath) -and -not (Test-Path -LiteralPath $resPath)) {
+                if ($null -eq $goneSince) { $goneSince = $watch.Elapsed }
+                elseif (($watch.Elapsed - $goneSince).TotalMilliseconds -ge 500) {
+                    return New-TfResult -ExitCode 124 -Transport 'relay' -Diagnostic 'claude-tfvc: the relay worker dropped the request (it expired before pickup, or the worker stopped); tf did not run'
+                }
+            } else { $goneSince = $null }
+            if ($watch.Elapsed.TotalSeconds -ge $TimeoutSec) {
+                return New-TfResult -ExitCode 124 -Transport 'relay' -Diagnostic "claude-tfvc: relay timeout: tf is still running in the interactive session after $TimeoutSec s; it will finish there, this call gives up"
+            }
+        }
+        Start-Sleep -Milliseconds 150
+    }
 }
 
 function Invoke-Tf {
@@ -200,15 +333,17 @@ function Invoke-Tf {
     # Without -Capture, direct mode streams to the console and StdOut is $null. The hook uses -Capture.
     param([string[]]$Arguments, [string]$ProjectDir, [string]$WorkingDirectory, [switch]$Capture, [int]$TimeoutSec = 600, [int]$PickupTimeoutSec = 30)
     if (-not $ProjectDir) { $ProjectDir = $env:CLAUDE_PROJECT_DIR }
-    if (-not $ProjectDir) { $ProjectDir = (Get-Location).Path }
-    if (-not $WorkingDirectory) { $WorkingDirectory = (Get-Location).Path }
+    if (-not $ProjectDir) { $ProjectDir = (Get-Location).ProviderPath }
+    if (-not $WorkingDirectory) { $WorkingDirectory = (Get-Location).ProviderPath }
     $tf = Resolve-TfExe -ProjectDir $ProjectDir
     if (-not $tf) {
         return New-TfResult -ExitCode 127 -Transport 'none' -Diagnostic 'claude-tfvc: no tf.exe found (checked the project .claude\settings*.json env.TF_EXE, TF_EXE, PATH, vswhere and the Visual Studio folders); install Team Explorer or pick one with /tf-select'
     }
     $choice = Resolve-TfTransport -ProjectDir $ProjectDir
     if ($choice.Transport -eq 'relay') {
-        if (-not (Test-TfRelayWorkerAlive (Get-TfRelayPaths)) -and -not (Test-TfRelayTaskRegistered)) {
+        $registered = $choice.TaskRegistered
+        if ($null -eq $registered -and -not (Test-TfRelayWorkerAlive (Get-TfRelayPaths))) { $registered = Test-TfRelayTaskRegistered }
+        if ($null -ne $registered -and -not $registered) {
             return New-TfResult -ExitCode 120 -Transport 'relay' -Diagnostic ('claude-tfvc: ' + (Get-TfRegistrationHint))
         }
         return Invoke-TfRelay -Tf $tf -Arguments $Arguments -WorkingDirectory $WorkingDirectory -TimeoutSec $TimeoutSec -PickupTimeoutSec $PickupTimeoutSec

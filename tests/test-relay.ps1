@@ -406,6 +406,124 @@ try {
         if (-not $exited) { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }
     } else { Skip 'R22/R23/R24/R33/R37 worker loop' 'no fake tf.exe' }
 
+    # ---- relay client (Invoke-Tf.ps1 relay mode through the real command line) --------------------------
+    function Note([string]$Name, [bool]$Ok, [string]$Detail) { [void]$Results.Add([pscustomobject]@{ Result = $(if ($Ok) { 'PASS' } else { 'INFO' }); Name = $Name; Detail = $Detail }) }
+    $RelayOn = Merge-Env $RelayEnv @{ TFVC_TRANSPORT = 'relay' }
+    if ($HaveFake) {
+        Reset-Relay
+        foreach ($exe in $Exes.Keys) {
+            foreach ($code in 0, 1, 100) {
+                $r = Invoke-Launcher $exe $RelayOn @('status', 'a b', "/exit:$code", '/stdout:hello out', '/stderr:oops err')
+                Check "$exe R2 relay: exit $code passes through, stdout/stderr come back, /noprompt appended" `
+                    (($r.Exit -eq $code) -and ($r.Out.Trim() -eq 'hello out') -and ($r.Err.Trim() -eq 'oops err') -and ($r.Calls.Count -eq 1) -and ($r.Calls[0][1] -eq 'a b') -and ($r.Calls[0][-1] -eq '/noprompt')) "exit=$($r.Exit) out=[$($r.Out.Trim())] err=[$($r.Err.Trim())] args=[$($r.Calls[0] -join '|')]"
+            }
+            $core = @('status', 'with space', 'trail\', 'D:\Projects\X\', $Sample, '%TEMP%', '&|^<>', '-noprompt')
+            $r = Invoke-Launcher $exe $RelayOn $core
+            $diff = Compare-Args $core $r.Calls[0]
+            Check "$exe R3r relay passes spaces, trailing backslashes, Hebrew, Cyrillic, %, & unchanged (and keeps -noprompt as the only noprompt)" ($diff -eq '') $diff
+
+            $r = Invoke-Launcher $exe $RelayOn @('status', '/ansi')
+            Check "$exe R4r ANSI tf output reaches the caller as readable UTF-8" ($r.Out.StartsWith($SampleRT)) "out=[$($r.Out.Trim())] want=[$SampleRT]"
+        }
+
+        # R5: ten clients at once, one worker, every answer to its own caller
+        Wait-NoWorker; Reset-Relay; Reset-FakeLog
+        $procs = @()
+        $saved = Set-TestEnv $RelayOn
+        try {
+            for ($i = 1; $i -le 10; $i++) {
+                $cl = ConvertTo-CommandLine (@('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', $InvokeTf, 'status', "/stdout:marker-$i"))
+                $procs += Start-Process -FilePath $Exes.powershell -ArgumentList $cl -RedirectStandardOutput (Join-Path $S "par-$i.out") -NoNewWindow -PassThru
+                $null = $procs[-1].Handle   # caches the process handle: without it Windows PowerShell 5.1 reports a null ExitCode for a fast child
+            }
+        } finally { Restore-TestEnv $saved }
+        foreach ($p in $procs) { $null = $p.WaitForExit(90000) }
+        $okAll = $true
+        for ($i = 1; $i -le 10; $i++) {
+            $txt = (Get-Content -LiteralPath (Join-Path $S "par-$i.out") -Raw -Encoding UTF8).Trim()
+            if ($procs[$i - 1].ExitCode -ne 0 -or $txt -ne "marker-$i") { $okAll = $false }
+        }
+        $calls = @(Get-FakeCalls)
+        $distinct = @($calls | ForEach-Object { $_[1] } | Sort-Object -Unique).Count
+        Check 'R5 10 parallel clients: each gets its own answer, 10 calls, none lost or duplicated' ($okAll -and ($calls.Count -eq 10) -and ($distinct -eq 10)) "ok=$okAll calls=$($calls.Count) distinct=$distinct exits=[$(($procs | ForEach-Object { $_.ExitCode }) -join ',')]"
+
+        # R7: nobody picks the request up -> 124, request deleted, a later worker finds nothing
+        Wait-NoWorker; Reset-Relay; Reset-FakeLog
+        $r = Invoke-InChild 'powershell' (Merge-Env $RelayOn @{ CLAUDE_TFVC_RELAY_LAUNCH = 'noop' }) ". '$InvokeTf'; `$x = Invoke-Tf -Arguments @('checkin','/comment:late') -PickupTimeoutSec 2 -TimeoutSec 10 -Capture; `"`$(`$x.ExitCode)|`$(`$x.Diagnostic)`""
+        $left = @(Get-ChildItem -LiteralPath $Queue -Filter '*.json' -ErrorAction SilentlyContinue).Count
+        $proc = Start-WorkerChild; $null = $proc.WaitForExit(15000)
+        Check 'R7 pickup timeout: exit 124 with the wait and task state, request deleted, never run later' (($r.Out -match '^124\|') -and ($r.Out -match 'relay timeout') -and ($left -eq 0) -and (@(Get-FakeCalls).Count -eq 0)) "out=[$($r.Out)] left=$left calls=$(@(Get-FakeCalls).Count)"
+
+        # R25: the worker drops a claimed request (expired on claim / crashed) -> 124 quickly, not after TimeoutSec
+        Wait-NoWorker; Reset-Relay
+        $dropScript = Join-Path $S 'drop-client.ps1'
+        Set-Content -LiteralPath $dropScript -Encoding Ascii -Value @(". '$InvokeTf'", "`$x = Invoke-Tf -Arguments @('status') -PickupTimeoutSec 8 -TimeoutSec 60 -Capture", 'Write-Output $x.ExitCode', 'Write-Output $x.Diagnostic')
+        $dropOut = Join-Path $S 'drop.out'
+        $saved = Set-TestEnv (Merge-Env $RelayOn @{ CLAUDE_TFVC_RELAY_LAUNCH = 'noop' })
+        try { $dp = Start-Process -FilePath $Exes.powershell -ArgumentList "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$dropScript`"" -RedirectStandardOutput $dropOut -NoNewWindow -PassThru } finally { Restore-TestEnv $saved }
+        $sw = [System.Diagnostics.Stopwatch]::StartNew(); $reqFile = $null
+        while ($sw.Elapsed.TotalSeconds -lt 6 -and -not $reqFile) { $reqFile = Get-ChildItem -LiteralPath $Queue -Filter '*.req.json' -ErrorAction SilentlyContinue | Select-Object -First 1; Start-Sleep -Milliseconds 100 }
+        if ($reqFile) { $runFile = $reqFile.FullName -replace '\.req\.json$', '.run.json'; Move-Item -LiteralPath $reqFile.FullName -Destination $runFile; Start-Sleep -Milliseconds 400; Remove-Item -LiteralPath $runFile -Force }
+        $null = $dp.WaitForExit(20000); $sw.Stop()
+        $lines = @(Get-Content -LiteralPath $dropOut)
+        Check 'R25 a claimed request that disappears without a response -> 124 "dropped" within seconds' (($lines[0] -eq '124') -and ($lines[1] -match 'dropped') -and ($sw.Elapsed.TotalSeconds -lt 15)) "lines=[$($lines -join ' / ')] secs=$([int]$sw.Elapsed.TotalSeconds)"
+
+        # R39: tf outlives TimeoutSec -> 124 now, the answer still lands later (tf was not aborted)
+        Reset-Relay; Wait-NoWorker
+        $r = Invoke-Launcher 'powershell' (Merge-Env $RelayOn @{ TFVC_RELAY_TIMEOUT = '2' }) @('get', '/sleep:4', '/stdout:late')
+        Start-Sleep -Seconds 6   # the fake sleeps 4 s from its (later) start; give the worker time to write the answer
+        $late = @(Get-ChildItem -LiteralPath $Queue -Filter '*.res.json' -ErrorAction SilentlyContinue).Count
+        Check 'R39 TFVC_RELAY_TIMEOUT: 124 with "still running" while tf finishes in the worker and its response is left for the sweep' (($r.Exit -eq 124) -and ($r.Err -match 'still running') -and ($late -eq 1)) "exit=$($r.Exit) err=[$($r.Err.Trim())] late=$late"
+
+        # R16: worker copy refreshed from the plugin when the hash differs, installed when missing
+        Reset-Relay; Wait-NoWorker
+        New-Item -ItemType Directory -Path $Queue -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $Relay 'Tf-RelayWorker.ps1') -Value '# stale worker'
+        Set-Content -LiteralPath (Join-Path $Relay 'worker.version') -Value @('version=0.0.0', 'sha256=DEADBEEF')
+        $r = Invoke-Launcher 'powershell' $RelayOn @('status', '/stdout:refreshed')
+        $srcHash = (Get-FileHash -LiteralPath $Worker -Algorithm SHA256).Hash
+        $sameText = (Get-Content -LiteralPath (Join-Path $Relay 'Tf-RelayWorker.ps1') -Raw) -eq (Get-Content -LiteralPath $Worker -Raw)
+        $verText = Get-Content -LiteralPath (Join-Path $Relay 'worker.version') -Raw
+        Check 'R16a stale worker copy is replaced before the request and worker.version records the new hash' (($r.Exit -eq 0) -and ($r.Out.Trim() -eq 'refreshed') -and $sameText -and ($verText -match "sha256=$srcHash") -and ($verText -match 'version=\d')) "exit=$($r.Exit) same=$sameText ver=[$($verText.Trim())]"
+        Reset-Relay; Wait-NoWorker
+        $r = Invoke-Launcher 'powershell' $RelayOn @('status', '/stdout:fresh')
+        Check 'R16b relay folder absent -> created, worker installed, request served' (($r.Exit -eq 0) -and ($r.Out.Trim() -eq 'fresh') -and (Test-Path -LiteralPath (Join-Path $Relay 'Tf-RelayWorker.ps1'))) "exit=$($r.Exit) out=[$($r.Out.Trim())]"
+
+        # R26: relay forced, task missing -> 120 with the registration command
+        $r = Invoke-Launcher 'powershell' (Merge-Env $RelayOn @{ CLAUDE_TFVC_RELAY_LAUNCH = 'none' }) @('status')
+        Check 'R26 TFVC_TRANSPORT=relay without the task -> exit 120 and the exact registration command on stderr' (($r.Exit -eq 120) -and ($r.Err -match 'not registered') -and ($r.Err -match 'Register-TfRelay\.ps1') -and ($r.Calls.Count -eq 0)) "exit=$($r.Exit) err=[$($r.Err.Trim())]"
+
+        # R12c: the worker's refusal reaches the caller as 120
+        Reset-Relay; Wait-NoWorker
+        $r = Invoke-Launcher 'powershell' (Merge-Env $RelayOn @{ CLAUDE_TFVC_RELAY_ALLOW_UNSIGNED = $null }) @('status')
+        Check 'R12c unsigned tf.exe refused by the worker -> exit 120 with the reason, tf not run' (($r.Exit -eq 120) -and ($r.Err -match 'not a Microsoft-signed') -and ($r.Calls.Count -eq 0)) "exit=$($r.Exit) err=[$($r.Err.Trim())]"
+        Wait-NoWorker
+    } else { Skip 'R2/R3r/R4r/R5/R7/R12c/R16/R25/R26/R39 relay client' 'no fake tf.exe' }
+
+    # ---- R3b Git Bash -> powershell -File -> launcher ---------------------------------------------------
+    if ($Bash -and $HaveFake) {
+        function Invoke-ViaBash([hashtable]$EnvVars, [string[]]$TfArgs) {
+            Reset-FakeLog
+            $saved = Set-TestEnv $EnvVars
+            try {
+                $q = ($TfArgs | ForEach-Object { "'" + $_.Replace("'", "'\''") + "'" }) -join ' '
+                $cmd = "powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File '$($InvokeTf.Replace('\', '/'))' $q"
+                $null = & $Bash -c $cmd 2>&1
+                return @{ Exit = $LASTEXITCODE; Calls = @(Get-FakeCalls) }
+            } finally { Restore-TestEnv $saved }
+        }
+        $bashCore = @('status', 'with space', 'trail\', $Sample, '%TEMP%', '&|^<>', '-noprompt')
+        foreach ($mode in 'direct', 'relay') {
+            $envVars = if ($mode -eq 'direct') { $DirectEnv } else { $RelayOn }
+            $r = Invoke-ViaBash $envVars $bashCore
+            $diff = Compare-Args $bashCore $r.Calls[0]
+            Check "R3b Git Bash -> powershell -File -> ${mode}: spaces, trailing backslash, Hebrew, Cyrillic, %, & unchanged" ($diff -eq '') $diff
+        }
+        Wait-NoWorker
+        $r = Invoke-ViaBash $DirectEnv @('status', '/noprompt')
+        Note 'R3c Git Bash leaves /noprompt alone (INFO when it becomes a path: then SKILL.md recommends -option from Bash, Task 10)' (($r.Calls.Count -eq 1) -and ($r.Calls[0][1] -eq '/noprompt')) "got=[$($r.Calls[0] -join '|')]"
+    } else { Skip 'R3b/R3c Git Bash' 'Git Bash or fake tf.exe missing' }
+
     # ---- report (keep this anchor last; later tasks insert their checks above it) --------------------
 }
 catch { Check 'HARNESS aborted by an exception (every check after this point was skipped)' $false "$($_.Exception.Message) at $($_.InvocationInfo.ScriptLineNumber)" }
