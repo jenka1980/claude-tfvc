@@ -13,6 +13,8 @@
   Configured values (1-2) count only if the file exists (surrounding quotes are tolerated); stale ones fall
   through. When several TF.exe exist (4-5), the newest file version wins.
 
+  The same reader (Get-ProjectEnvSetting) serves TFVC_TRANSPORT for Invoke-Tf.ps1.
+
   Runs on Windows PowerShell 5.1 as well as PowerShell 7. Keep this file pure ASCII: 5.1 reads BOM-less files
   in the ANSI code page. Dot-sourcing it (". Find-Tf.ps1") only defines the functions and prints nothing.
 
@@ -76,19 +78,30 @@ function Resolve-TfCandidate {
     return $null
 }
 
-function Get-ProjectTfSetting {
-    # env.TF_EXE from the project's Claude Code settings (written by /tf-select):
-    # .claude\settings.local.json wins over .claude\settings.json, like Claude Code's own precedence.
-    param([string]$ProjectDir)
-    if (-not $ProjectDir) { return $null }
-    foreach ($name in 'settings.local.json', 'settings.json') {
-        $file = Join-Path (Join-Path $ProjectDir '.claude') $name
-        if (Test-Path -LiteralPath $file -PathType Leaf) {
-            $value = (Get-Content -LiteralPath $file -Raw | ConvertFrom-Json).env.TF_EXE
-            if ($value) { return $value }
+function Get-ProjectEnvSetting {
+    # env.<Name> from the project's Claude Code settings: .claude\settings.local.json wins over
+    # .claude\settings.json, like Claude Code's own precedence. Used for TF_EXE (/tf-select) and
+    # TFVC_TRANSPORT (/tf-relay). -Detailed also tells which file the value came from.
+    param([string]$ProjectDir, [string]$Name, [switch]$Detailed)
+    if ($ProjectDir) {
+        foreach ($file in 'settings.local.json', 'settings.json') {
+            $path = Join-Path (Join-Path $ProjectDir '.claude') $file
+            if (Test-Path -LiteralPath $path -PathType Leaf) {
+                $value = (Get-Content -LiteralPath $path -Raw | ConvertFrom-Json).env.$Name
+                if ($value) {
+                    if ($Detailed) { return [pscustomobject]@{ Value = "$value"; Source = $file } }
+                    return "$value"
+                }
+            }
         }
     }
     return $null
+}
+
+function Get-ProjectTfSetting {
+    # env.TF_EXE from the project's Claude Code settings (written by /tf-select).
+    param([string]$ProjectDir)
+    return Get-ProjectEnvSetting -ProjectDir $ProjectDir -Name 'TF_EXE'
 }
 
 function Resolve-TfExe {

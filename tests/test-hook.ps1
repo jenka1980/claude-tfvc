@@ -267,6 +267,21 @@ foreach ($exe in $Exes.Keys) {
     Check "$exe T22 Find-Tf.ps1 with no TF.exe anywhere -> no output, exit 1" (($r.Exit -eq 1) -and ($r.Out -eq '')) "exit=$($r.Exit) out=[$($r.Out)]"
 }
 
+# ---- Find-Tf.ps1: Get-ProjectEnvSetting (shared by TF_EXE and TFVC_TRANSPORT) ---------------------
+foreach ($exe in $Exes.Keys) {
+    $cmd = ". '$FindTf'; Get-ProjectEnvSetting -ProjectDir '$Proj' -Name OTHER"
+    $got = (& $Exes[$exe] -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command $cmd 2>&1 | Out-String).Trim()
+    Check "$exe T25 Get-ProjectEnvSetting reads any env.<Name> from settings.local.json" ($got -eq '1') "got=[$got]"
+
+    $cmd = ". '$FindTf'; (Get-ProjectEnvSetting -ProjectDir '$ProjShared' -Name TF_EXE -Detailed).Source"
+    $got = (& $Exes[$exe] -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command $cmd 2>&1 | Out-String).Trim()
+    Check "$exe T26 Get-ProjectEnvSetting -Detailed names the file the value came from" ($got -eq 'settings.json') "got=[$got]"
+
+    $cmd = ". '$FindTf'; if ((Get-ProjectEnvSetting -ProjectDir '$ProjNoCfg' -Name TF_EXE) -eq `$null) { 'null' } else { 'value' }"
+    $got = (& $Exes[$exe] -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command $cmd 2>&1 | Out-String).Trim()
+    Check "$exe T27 Get-ProjectEnvSetting returns null for a project without .claude settings" ($got -eq 'null') "got=[$got]"
+}
+
 # ---- static checks ------------------------------------------------------------------------
 foreach ($f in @($Hook, $FindTf)) {
     $name = Split-Path -Leaf $f
