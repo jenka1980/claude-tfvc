@@ -130,7 +130,7 @@ function Invoke-InChild([string]$Exe, [hashtable]$EnvVars, [string]$Command) {
         return @{ Exit = $LASTEXITCODE; Out = $out }
     } finally { Restore-TestEnv $saved }
 }
-function Reset-Relay { if (Test-Path -LiteralPath $Relay) { Remove-Item -LiteralPath $Relay -Recurse -Force -ErrorAction SilentlyContinue } }
+function Reset-Relay { Wait-NoWorker; if (Test-Path -LiteralPath $Relay) { Remove-Item -LiteralPath $Relay -Recurse -Force -ErrorAction SilentlyContinue } }
 function Wait-NoWorker { $deadline = (Get-Date).AddSeconds(10); while ((Get-Date) -lt $deadline -and (Test-TfRelayWorkerAlive (Get-RelayPaths))) { Start-Sleep -Milliseconds 200 } }
 function Get-RelayPaths { $saved = Set-TestEnv @{ CLAUDE_TFVC_RELAY_ROOT = $Relay }; try { return Get-TfRelayPaths } finally { Restore-TestEnv $saved } }
 
@@ -528,14 +528,14 @@ try {
         Check 'R25 a claimed request that disappears without a response -> 124 "dropped" within seconds' (($lines[0] -eq '124') -and ($lines[1] -match 'dropped') -and ($sw.Elapsed.TotalSeconds -lt 15)) "lines=[$($lines -join ' / ')] secs=$([int]$sw.Elapsed.TotalSeconds)"
 
         # R39: tf outlives TimeoutSec -> 124 now, the answer still lands later (tf was not aborted)
-        Reset-Relay; Wait-NoWorker
+        Reset-Relay
         $r = Invoke-Launcher 'powershell' (Merge-Env $RelayOn @{ TFVC_RELAY_TIMEOUT = '2' }) @('get', '/sleep:4', '/stdout:late')
         Start-Sleep -Seconds 6   # the fake sleeps 4 s from its (later) start; give the worker time to write the answer
         $late = @(Get-ChildItem -LiteralPath $Queue -Filter '*.res.json' -ErrorAction SilentlyContinue).Count
         Check 'R39 TFVC_RELAY_TIMEOUT: 124 with "still running" while tf finishes in the worker and its response is left for the sweep' (($r.Exit -eq 124) -and ($r.Err -match 'still running') -and ($late -eq 1)) "exit=$($r.Exit) err=[$($r.Err.Trim())] late=$late"
 
         # R16: worker copy refreshed from the plugin when the hash differs, installed when missing
-        Reset-Relay; Wait-NoWorker
+        Reset-Relay
         New-Item -ItemType Directory -Path $Queue -Force | Out-Null
         Set-Content -LiteralPath (Join-Path $Relay 'Tf-RelayWorker.ps1') -Value '# stale worker'
         Set-Content -LiteralPath (Join-Path $Relay 'worker.version') -Value @('version=0.0.0', 'sha256=DEADBEEF')
@@ -543,13 +543,13 @@ try {
         $srcHash = (Get-FileHash -LiteralPath $Worker -Algorithm SHA256).Hash
         $sameText = (Get-Content -LiteralPath (Join-Path $Relay 'Tf-RelayWorker.ps1') -Raw) -eq (Get-Content -LiteralPath $Worker -Raw)
         $verText = Get-Content -LiteralPath (Join-Path $Relay 'worker.version') -Raw
-        Check 'R16a stale worker copy is replaced before the request and worker.version records the new hash' (($r.Exit -eq 0) -and ($r.Out.Trim() -eq 'refreshed') -and $sameText -and ($verText -match "sha256=$srcHash") -and ($verText -match 'version=\d')) "exit=$($r.Exit) same=$sameText ver=[$($verText.Trim())]"
-        Reset-Relay; Wait-NoWorker
+        Check 'R16a stale worker copy is replaced before the request and worker.version records the new hash' (($r.Exit -eq 0) -and ($r.Out.Trim() -eq 'refreshed') -and $sameText -and ($verText -match "sha256=$srcHash") -and ($verText -match 'version=\d')) "exit=$($r.Exit) same=$sameText ver=[$($verText.Trim())] err=[$($r.Err.Trim())]"
+        Reset-Relay
         $r = Invoke-Launcher 'powershell' $RelayOn @('status', '/stdout:fresh')
-        Check 'R16b relay folder absent -> created, worker installed, request served' (($r.Exit -eq 0) -and ($r.Out.Trim() -eq 'fresh') -and (Test-Path -LiteralPath (Join-Path $Relay 'Tf-RelayWorker.ps1'))) "exit=$($r.Exit) out=[$($r.Out.Trim())]"
+        Check 'R16b relay folder absent -> created, worker installed, request served' (($r.Exit -eq 0) -and ($r.Out.Trim() -eq 'fresh') -and (Test-Path -LiteralPath (Join-Path $Relay 'Tf-RelayWorker.ps1'))) "exit=$($r.Exit) out=[$($r.Out.Trim())] err=[$($r.Err.Trim())]"
 
         # R16c: ten clients install the worker at the same time from an empty relay folder; none may fail.
-        Reset-Relay; Wait-NoWorker
+        Reset-Relay
         $instOut = foreach ($i in 1..10) { Join-Path $S "inst-$i.out" }
         $saved = Set-TestEnv $RelayOn
         $ips = @()
@@ -586,7 +586,7 @@ try {
         Check 'R26 TFVC_TRANSPORT=relay without the task -> exit 120 and the exact registration command on stderr' (($r.Exit -eq 120) -and ($r.Err -match 'not registered') -and ($r.Err -match 'Register-TfRelay\.ps1') -and ($r.Calls.Count -eq 0)) "exit=$($r.Exit) err=[$($r.Err.Trim())]"
 
         # R12c: the worker's refusal reaches the caller as 120
-        Reset-Relay; Wait-NoWorker
+        Reset-Relay
         $r = Invoke-Launcher 'powershell' (Merge-Env $RelayOn @{ CLAUDE_TFVC_RELAY_ALLOW_UNSIGNED = $null }) @('status')
         Check 'R12c unsigned tf.exe refused by the worker -> exit 120 with the reason, tf not run' (($r.Exit -eq 120) -and ($r.Err -match 'not a Microsoft-signed') -and ($r.Calls.Count -eq 0)) "exit=$($r.Exit) err=[$($r.Err.Trim())]"
         Wait-NoWorker
@@ -639,7 +639,7 @@ try {
     $HookEnv = Merge-Env $RelayEnv @{ CLAUDE_PROJECT_DIR = $Proj }    # $Proj\.claude\settings.local.json says relay
     if ($HaveFake) {
         foreach ($exe in $Exes.Keys) {
-            Reset-Relay; Wait-NoWorker
+            Reset-Relay
             $r = Invoke-HookCase $exe $HookEnv $RoFile
             Check "$exe R10 hook, relay mode: read-only file -> 'checkout /noprompt <path>' through the queue, exit 0, silent" `
                 (($r.Exit -eq 0) -and ($r.Out -eq '') -and ($r.Calls.Count -eq 1) -and (($r.Calls[0] -join ' ') -eq "checkout /noprompt $RoFile")) "exit=$($r.Exit) out=[$($r.Out)] args=[$($r.Calls[0] -join '|')]"
@@ -658,7 +658,7 @@ try {
 
             # The hook passes only 'checkout /noprompt <file>', so the fake cannot be told to fail; drive a failure
             # through the transport instead: forced relay with the unsigned bypass removed -> worker refusal -> 120.
-            Reset-Relay; Wait-NoWorker
+            Reset-Relay
             $r = Invoke-HookCase $exe (Merge-Env $HookEnv @{ CLAUDE_TFVC_RELAY_ALLOW_UNSIGNED = $null }) $RoFile
             $json = $null; try { $json = $r.Out | ConvertFrom-Json } catch { }
             $ctx = if ($json) { "$($json.hookSpecificOutput.additionalContext)" } else { '' }
@@ -683,7 +683,7 @@ try {
                 $json = $null; try { $json = $r.Out | ConvertFrom-Json } catch { }
                 $ctx = if ($json) { "$($json.hookSpecificOutput.additionalContext)" } else { '' }
                 Check "$exe R27d hook, forced direct, TF30063 -> context shows the error but no /tf-relay hint" (($r.Exit -eq 0) -and ($ctx -match 'TF30063') -and ($ctx -notmatch '/tf-relay')) "exit=$($r.Exit) out=[$($r.Out)]"
-                Reset-Relay; Wait-NoWorker
+                Reset-Relay
                 New-TestFile $RoFile $true
                 $r = Invoke-HookCase $exe $HookEnv $RoFile
                 $json = $null; try { $json = $r.Out | ConvertFrom-Json } catch { }
@@ -707,7 +707,7 @@ try {
     # ---- Register-TfRelay.ps1: -Status under the seams, the task spec, decoded failure codes ---------------
     $StatusEnv = Merge-Env $RelayOn @{ CLAUDE_PROJECT_DIR = $ProjNone }
     if ($HaveFake) {
-        Reset-Relay; Wait-NoWorker
+        Reset-Relay
         $r = Invoke-InChild 'powershell' $StatusEnv "& '$Register' -Status -NoProbe; exit `$LASTEXITCODE"
         Check 'R17a -Status with the task (simulated) and no probe -> exit 0, reports transport and task' (($r.Exit -eq 0) -and ($r.Out -match '(?m)^Transport:\s+relay') -and ($r.Out -match 'simulated')) "exit=$($r.Exit) out=[$($r.Out)]"
 

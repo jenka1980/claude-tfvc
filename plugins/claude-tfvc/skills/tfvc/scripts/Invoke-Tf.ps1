@@ -235,8 +235,19 @@ function Install-TfRelayWorker {
     $tmp = "$($Paths.Worker).$([guid]::NewGuid().ToString('n')).tmp"
     try {
         Copy-Item -LiteralPath $Paths.Source -Destination $tmp -ErrorAction Stop
-        if (Test-Path -LiteralPath $Paths.Worker -PathType Leaf) { [System.IO.File]::Replace($tmp, $Paths.Worker, [NullString]::Value) }   # atomic on NTFS; PowerShell turns a plain $null into "" for a string parameter, which Replace rejects
-        else { [System.IO.File]::Move($tmp, $Paths.Worker) }
+        # A file written an instant ago (or one a scanner has open) can hold a sharing violation briefly: retry
+        # on IOException before giving up to the catch below.
+        for ($try = 1; $true; $try++) {
+            try {
+                if (Test-Path -LiteralPath $Paths.Worker -PathType Leaf) { [System.IO.File]::Replace($tmp, $Paths.Worker, [NullString]::Value) }   # atomic on NTFS; PowerShell turns a plain $null into "" for a string parameter, which Replace rejects
+                else { [System.IO.File]::Move($tmp, $Paths.Worker) }
+                break
+            }
+            catch [System.IO.IOException] {
+                if ($try -ge 10) { throw }
+                Start-Sleep -Milliseconds 100
+            }
+        }
     }
     catch {
         # Another client may have installed the same file an instant ago: then only worker.version is left to do.
