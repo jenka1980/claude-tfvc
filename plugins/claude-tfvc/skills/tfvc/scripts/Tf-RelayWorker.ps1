@@ -162,3 +162,45 @@ function Invoke-RelayRequest {
     $what = if ($res.error) { 'error' } else { "exit=$($res.exitCode)" }
     Write-RelayLog "$id $verb $what ${ms}ms"
 }
+
+function Remove-RelayOrphans {
+    # Requests nobody claimed, responses nobody collected, and temp files, older than $RelayOrphanMin minutes.
+    $cutoff = [DateTime]::UtcNow.AddMinutes(-$RelayOrphanMin)
+    Get-ChildItem -LiteralPath $RelayQueue -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.LastWriteTimeUtc -lt $cutoff -and ($_.Name -match '\.(req|run|res)\.json$' -or $_.Extension -eq '.tmp') } |
+        ForEach-Object { Write-RelayLog "sweep $($_.Name)"; Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue }
+}
+
+function Start-RelayWorker {
+    New-Item -ItemType Directory -Path $RelayQueue -Force | Out-Null
+    try { $lock = [System.IO.File]::Open($RelayLock, [System.IO.FileMode]::OpenOrCreate, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None) }
+    catch { return }   # another worker is alive and will drain the queue
+    try {
+        # Pin the console to the ANSI code page: a tf.exe that sees our (hidden) console then writes ANSI, and a
+        # tf.exe that sees no console writes ANSI anyway, so Invoke-RelayRequest can decode both the same way.
+        try { [Console]::OutputEncoding = Get-AnsiEncoding } catch { }
+        Write-RelayLog "start worker $WorkerVersion pid $PID linger ${RelayLingerSec}s"
+        $born = [DateTime]::UtcNow
+        $idleSince = $born
+        $lastSweep = [DateTime]::MinValue
+        while ($true) {
+            $now = [DateTime]::UtcNow
+            if (($now - $lastSweep).TotalSeconds -ge 60) { Remove-RelayOrphans; $lastSweep = $now }
+            if (($now - $born).TotalMinutes -ge $RelayMaxLifeMin) { Write-RelayLog 'stop: life limit'; break }
+            $next = Get-ChildItem -LiteralPath $RelayQueue -Filter '*.req.json' -File -ErrorAction SilentlyContinue |
+                    Sort-Object LastWriteTimeUtc, Name | Select-Object -First 1
+            if ($next) {
+                $runPath = $next.FullName -replace '\.req\.json$', '.run.json'
+                try { [System.IO.File]::Move($next.FullName, $runPath) } catch { continue }   # claimed by another instance
+                Invoke-RelayRequest -RunPath $runPath
+                $idleSince = [DateTime]::UtcNow
+                continue
+            }
+            if (($now - $idleSince).TotalSeconds -ge $RelayLingerSec) { Write-RelayLog 'stop: idle'; break }
+            Start-Sleep -Milliseconds 200
+        }
+    }
+    finally { $lock.Close() }
+}
+
+if ($MyInvocation.InvocationName -ne '.') { Start-RelayWorker }

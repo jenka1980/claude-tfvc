@@ -340,6 +340,61 @@ try {
     Check 'R36 ConvertTo-CommandLine in Invoke-Tf.ps1 and Tf-RelayWorker.ps1 are identical' `
         ((Get-FunctionText $InvokeTf 'ConvertTo-CommandLine') -eq (Get-FunctionText $Worker 'ConvertTo-CommandLine')) 'copies differ (or one is missing)'
 
+    # ---- worker: the loop (run as a real child process, powershell.exe) ---------------------------------
+    function Start-WorkerChild([hashtable]$ExtraEnv) {
+        $envVars = Merge-Env @{ CLAUDE_TFVC_RELAY_ROOT = $Relay; CLAUDE_TFVC_RELAY_ALLOW_UNSIGNED = '1'; CLAUDE_TFVC_RELAY_LINGER_SEC = '1' } $(if ($ExtraEnv) { $ExtraEnv } else { @{} })
+        $saved = Set-TestEnv $envVars
+        try { return (Start-Process -FilePath $Exes.powershell -ArgumentList "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$Worker`"" -WindowStyle Hidden -PassThru) }
+        finally { Restore-TestEnv $saved }
+    }
+    function Write-QueuedRequest($Request, [string]$Kind = 'req') {
+        New-Item -ItemType Directory -Path $Queue -Force | Out-Null
+        $path = Join-Path $Queue "$($Request.id).$Kind.json"
+        [System.IO.File]::WriteAllText($path, ($Request | ConvertTo-Json -Depth 4 -Compress), $Utf8)
+        return $path
+    }
+    function Get-WorkerLog { if (Test-Path -LiteralPath (Join-Path $Relay 'worker.log')) { Get-Content -LiteralPath (Join-Path $Relay 'worker.log') } else { @() } }
+    if ($HaveFake) {
+        Reset-Relay; Reset-FakeLog
+        $first = New-Request @('status', '/stdout:first'); $p1 = Write-QueuedRequest $first
+        Start-Sleep -Milliseconds 1100   # distinct last-write times
+        $second = New-Request @('status', '/stdout:second'); $p2 = Write-QueuedRequest $second
+        $proc = Start-WorkerChild
+        $exited = $proc.WaitForExit(15000)
+        $res1 = Get-Content -LiteralPath (Join-Path $Queue "$($first.id).res.json") -Raw | ConvertFrom-Json
+        $res2 = Get-Content -LiteralPath (Join-Path $Queue "$($second.id).res.json") -Raw | ConvertFrom-Json
+        $log = @(Get-WorkerLog)
+        $order = ($log | Where-Object { $_ -match "($($first.id)|$($second.id)) status exit" } | ForEach-Object { if ($_ -match $first.id) { '1' } else { '2' } }) -join ''
+        Check 'R22 worker drains two queued requests oldest first, answers both, exits after the linger' `
+            ($exited -and ($res1.stdout.Trim() -eq 'first') -and ($res2.stdout.Trim() -eq 'second') -and ($order -eq '12') -and ($log[0] -match 'start worker') -and ($log[-1] -match 'stop: idle')) "exited=$exited order=$order log=[$($log -join ' / ')]"
+        Check 'R22b worker.lock is released at exit (a client probe can open it)' (-not (Test-TfRelayWorkerAlive (Get-RelayPaths))) 'lock still held'
+
+        Reset-Relay; Reset-FakeLog
+        $req = New-Request @('status', '/sleep:3'); Write-QueuedRequest $req | Out-Null
+        $pa = Start-WorkerChild; Start-Sleep -Milliseconds 700; $pb = Start-WorkerChild
+        $null = $pa.WaitForExit(20000); $null = $pb.WaitForExit(20000)
+        $starts = @(Get-WorkerLog | Where-Object { $_ -match 'start worker' }).Count
+        Check 'R23 a second worker started while the first holds the lock exits at once; the request runs exactly once' (($starts -eq 1) -and (@(Get-FakeCalls).Count -eq 1)) "starts=$starts calls=$(@(Get-FakeCalls).Count)"
+
+        Reset-Relay
+        New-Item -ItemType Directory -Path $Queue -Force | Out-Null
+        $old = Join-Path $Queue 'old.res.json'; Set-Content -LiteralPath $old -Value '{}'; (Get-Item -LiteralPath $old).LastWriteTimeUtc = [DateTime]::UtcNow.AddHours(-2)
+        $oldTmp = Join-Path $Queue 'x.tmp'; Set-Content -LiteralPath $oldTmp -Value 'x'; (Get-Item -LiteralPath $oldTmp).LastWriteTimeUtc = [DateTime]::UtcNow.AddHours(-2)
+        $fresh = Join-Path $Queue 'fresh.res.json'; Set-Content -LiteralPath $fresh -Value '{}'
+        $proc = Start-WorkerChild; $null = $proc.WaitForExit(15000)
+        Check 'R24 orphans older than an hour are swept at start; fresh files stay' ((-not (Test-Path -LiteralPath $old)) -and (-not (Test-Path -LiteralPath $oldTmp)) -and (Test-Path -LiteralPath $fresh)) "old=$(Test-Path $old) tmp=$(Test-Path $oldTmp) fresh=$(Test-Path $fresh)"
+
+        Reset-Relay; Reset-FakeLog
+        New-Item -ItemType Directory -Path $Queue -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $Queue 'garbage.txt') -Value 'ignore me'
+        [System.IO.File]::WriteAllText((Join-Path $Queue 'bad.req.json'), '{ not json', $Utf8)
+        $good = New-Request @('status', '/stdout:good'); Write-QueuedRequest $good | Out-Null
+        $proc = Start-WorkerChild; $null = $proc.WaitForExit(15000)
+        $resGood = Get-Content -LiteralPath (Join-Path $Queue "$($good.id).res.json") -Raw | ConvertFrom-Json
+        Check 'R33 a corrupt .req.json is deleted, a foreign file is ignored, the good request is still served' `
+            (($resGood.stdout.Trim() -eq 'good') -and (-not (Test-Path -LiteralPath (Join-Path $Queue 'bad.req.json'))) -and (-not (Test-Path -LiteralPath (Join-Path $Queue 'bad.run.json'))) -and (Test-Path -LiteralPath (Join-Path $Queue 'garbage.txt'))) "good=[$($resGood.stdout)]"
+    } else { Skip 'R22/R23/R24/R33 worker loop' 'no fake tf.exe' }
+
     # ---- report (keep this anchor last; later tasks insert their checks above it) --------------------
 }
 catch { Check 'HARNESS aborted by an exception (every check after this point was skipped)' $false "$($_.Exception.Message) at $($_.InvocationInfo.ScriptLineNumber)" }
