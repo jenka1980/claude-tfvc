@@ -33,6 +33,10 @@ All notable changes to this project are documented here. Versioning follows [Sem
   a locked `worker.version`. On pwsh the launcher decodes `tf` output with the system ANSI code page.
 - `/tf-relay on` still writes `relay` when registration is declined and warns about exit 120; the exported
   `TFVC_TRANSPORT` variable needs a session restart, the settings file is read on every call.
+- `tests/test-hook.ps1` pins `TFVC_TRANSPORT=direct`: it covers `tf.exe` resolution and the read-only hook, and
+  left to `auto` it failed 19 of its 63 checks when run from an SSH session with the relay registered, because
+  the worker correctly refuses the harness's fake `tf.exe` under `%TEMP%`. Relay coverage stays in
+  `tests/test-relay.ps1`.
 ### Security
 - The relay worker runs only a Microsoft-signed executable named `tf.exe`, from an argument array, with
   `/noprompt` forced and stdin closed; no credentials are stored; comments and output are never logged.

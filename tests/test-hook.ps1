@@ -14,6 +14,10 @@
 param([string]$WorkDir = (Join-Path $env:TEMP 'claude\tfvc-tests'))
 
 $ErrorActionPreference = 'Continue'
+# This harness covers tf.exe resolution and the read-only hook, never the transport: pin direct so the fake
+# tf.exe runs in-process. Left to 'auto', an SSH session with the relay task registered would hand every
+# checkout to the worker, which rightly refuses a tf.exe under %TEMP%. Relay coverage is tests\test-relay.ps1.
+$env:TFVC_TRANSPORT = 'direct'
 $Repo      = Split-Path -Parent $PSScriptRoot
 $Plugin    = Join-Path $Repo 'plugins\claude-tfvc'
 $Hook      = Join-Path $Plugin 'hooks\tfvc-checkout.ps1'
